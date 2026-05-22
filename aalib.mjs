@@ -319,7 +319,7 @@ function getrenderparams() {
     return {
         bright:    0,         // -255..+255
         contrast:  0,         // -255..+255 (0 = identity)
-        gamma:     1.0,       // gamma is not applied by default
+        gamma:     1.0,       // applied as a luminance LUT when != 1.0
         dither:    AA_NONE,
         randomval: 0,         // 0..100
         inversion: 0,         // 0 or 1
@@ -369,6 +369,21 @@ function render(ctx, params, sx, sy, sw, sh) {
     const randval  = params.randomval| 0
     const inv      = params.inversion ? 1 : 0
     const contMul  = (256 + contrast) / 256
+    const gamma    = (params.gamma === undefined) ? 1.0 : params.gamma
+    let gLut = null
+    if (gamma !== 1.0) {
+        if (!ctx._gammaLut || ctx._gammaG !== gamma) {
+            ctx._gammaLut = new Uint8Array(256)
+            for (let v = 0; v < 256; v++) {
+                let g = Math.pow(v / 255, gamma) * 255
+                if (g < 0) g = 0
+                if (g > 255) g = 255
+                ctx._gammaLut[v] = g | 0
+            }
+            ctx._gammaG = gamma
+        }
+        gLut = ctx._gammaLut
+    }
 
     const useFS = (dither === AA_FLOYD_S)
     let err = null
@@ -390,6 +405,10 @@ function render(ctx, params, sx, sy, sw, sh) {
             const iSE = iSW + 1
 
             let nw = buf[iNW], ne = buf[iNE], sw2 = buf[iSW], se = buf[iSE]
+
+            if (gLut) {
+                nw = gLut[nw]; ne = gLut[ne]; sw2 = gLut[sw2]; se = gLut[se]
+            }
 
             if (contrast || bright) {
                 nw  = _clamp8((nw  - 128) * contMul + 128 + bright)

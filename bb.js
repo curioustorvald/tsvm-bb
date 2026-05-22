@@ -1255,95 +1255,1134 @@ function scene4() {
 }
 
 // ============================================================================
-// SCENE 5 — text shower (substitute for the 3D-torus dithering demo)
+// 3D engine — near-verbatim port of tex.c (the env-mapped triangle rasteriser
+// behind scene5's torus and scene10's patnik). The polygon tables (torus.h,
+// patnik.h in the original) are pre-converted to little-endian binaries
+// (torus.poly, patnik.poly) — see /tmp/conv_polys.py — with a 4-byte header
+// (uint16 nFaces, 2 reserved) followed by nFaces × 3 vertices × 9 bytes
+// (xyz: 3 × int8, normal: 3 × int16).
+//
+// Per-frame pipeline (mirrors tex.c::disp3d):
+//   1. Rotate every vertex through alfa (Y-axis), beta (X-axis), gama (Z-axis).
+//      Normals get the same treatment — including the C version's "feature"
+//      where the β/γ stages of the normal accidentally reuse the position's
+//      rotated z (bb-tex.c lines 287-288). We preserve it for faithful lighting.
+//   2. Project: (x', y') = (rot.x << 8) / (256 + rot.z) × XRATIO + X_S, etc.
+//      Z is kept for the z-buffer.
+//   3. Backface cull via signed area: ZZ ≤ 0 ⇒ visible.
+//   4. Scanline-fill each triangle, sampling envmapa[(|ny|/128+64), (|nx|/128+64)]
+//      per pixel, gated by a z-buffer with a 500-unit slack (so triangle seams
+//      don't fight on the boundary).
+// ============================================================================
+let g_3dObj   = null       // current loaded object (torus or patnik)
+let g_3dEnv   = null       // 128×128 env-map LUT (Uint8Array)
+let g_alfa    = 0
+let g_beta    = 0
+let g_gama    = 0
+let g_centerx = 0
+let g_centery = 0
+let g_centerz = 0
+let g_zoom    = 2.0
+let g_sinTab  = null       // Float64Array(361)
+let g_cosTab  = null
+// Per-vertex working buffers. Reallocated when the active object changes (so
+// torus's 256-face buffer is half the size of patnik's 450-face one).
+let g_3dRotX = null, g_3dRotY = null, g_3dRotZ = null
+let g_3dRotNx = null, g_3dRotNy = null
+let g_3dPolyX = null, g_3dPolyY = null
+let g_3dZbuf  = null       // Int32Array(imgW * imgH); reused across frames.
+
+function _3dPrecalc() {
+    if (g_sinTab) return
+    g_sinTab = new Float64Array(361)
+    g_cosTab = new Float64Array(361)
+    const DEG = Math.PI / 180
+    for (let i = 0; i <= 360; i++) {
+        g_sinTab[i] = Math.sin(i * DEG)
+        g_cosTab[i] = Math.cos(i * DEG)
+    }
+}
+
+// Read torus.poly or patnik.poly. Returns {nFaces, ox, oy, oz, onx, ony, onz}
+// — three flat arrays per axis sized nFaces*3 so the inner loop can index by
+// face*3 + vertex without object churn.
+function _3dReadPoly(name) {
+    let fh
+    try { fh = files.open(BB_DIR + name + ".poly") }
+    catch (e) { serial.println("bb: poly open failed: " + name + " - " + e); return null }
+    if (!fh.exists) { serial.println("bb: poly missing: " + name); return null }
+    const blob = fh.bread()
+    if (!blob || blob.length < 4) { serial.println("bb: poly truncated: " + name); return null }
+    const nFaces = (blob[0] & 0xFF) | ((blob[1] & 0xFF) << 8)
+    const N = nFaces * 3
+    const ox  = new Int8Array(N),  oy  = new Int8Array(N),  oz  = new Int8Array(N)
+    const onx = new Int16Array(N), ony = new Int16Array(N), onz = new Int16Array(N)
+    let p = 4
+    for (let i = 0; i < N; i++) {
+        // Int8 sign-extend through the JS Int8Array view.
+        const xb = blob[p++] & 0xFF; ox[i] = (xb < 128) ? xb : xb - 256
+        const yb = blob[p++] & 0xFF; oy[i] = (yb < 128) ? yb : yb - 256
+        const zb = blob[p++] & 0xFF; oz[i] = (zb < 128) ? zb : zb - 256
+        // Int16 LE, sign-extend.
+        let v = (blob[p++] & 0xFF) | ((blob[p++] & 0xFF) << 8); onx[i] = v > 32767 ? v - 65536 : v
+        v     = (blob[p++] & 0xFF) | ((blob[p++] & 0xFF) << 8); ony[i] = v > 32767 ? v - 65536 : v
+        v     = (blob[p++] & 0xFF) | ((blob[p++] & 0xFF) << 8); onz[i] = v > 32767 ? v - 65536 : v
+    }
+    return { nFaces: nFaces, ox: ox, oy: oy, oz: oz, onx: onx, ony: ony, onz: onz }
+}
+
+// Build the 128×128 env-map using the same formula as tex.c::torusconstructor /
+// patnikconstructor: a falloff curve raised to gammaExp and scaled by mul,
+// indexed by squared distance from the centre.
+function _3dBuildEnvmap(gammaExp, mul) {
+    const table = new Uint8Array(256)
+    for (let k = 0; k < 256; k++) {
+        let v = Math.pow(k / 256, gammaExp) * mul
+        if (v < 0) v = 0
+        if (v > 255) v = 255
+        table[k] = v | 0
+    }
+    const env = new Uint8Array(128 * 128)
+    for (let i = 0; i < 128; i++) {
+        for (let j = 0; j < 128; j++) {
+            const k = (((0x7A120) / ((i - 64) * (i - 64) + (j - 64) * (j - 64) + 2100)) | 0) & 0xFF
+            env[i * 128 + j] = table[k]
+        }
+    }
+    return env
+}
+
+function _3dAllocWorkBuffers(nFaces) {
+    const N = nFaces * 3
+    g_3dRotX  = new Float64Array(N); g_3dRotY  = new Float64Array(N); g_3dRotZ  = new Float64Array(N)
+    g_3dRotNx = new Float64Array(N); g_3dRotNy = new Float64Array(N)
+    g_3dPolyX = new Int32Array(N);   g_3dPolyY = new Int32Array(N)
+}
+
+function _3dLoad(name, gammaExp, mul) {
+    _3dPrecalc()
+    const obj = _3dReadPoly(name)
+    if (!obj) return
+    g_3dObj = obj
+    g_3dEnv = _3dBuildEnvmap(gammaExp, mul)
+    _3dAllocWorkBuffers(obj.nFaces)
+}
+
+function torusconstructor()  { _3dLoad("torus",  3.0, 200.0) }
+function patnikconstructor() { _3dLoad("patnik", 2.0, 256.0) }
+
+// set_zbuff — allocate the z-buffer at the current image resolution. Mirrors
+// tex.c::set_zbuff. Called by scene5 before its first disp3d.
+function set_zbuff() {
+    const ctx = aaCtx()
+    g_3dZbuf = new Int32Array(ctx.imgW * ctx.imgH)
+}
+
+// disp3d — rotate, project, rasterise. Reads g_alfa/beta/gama/centerx/y/z/zoom
+// (the same module-level globals the C demo uses).
+function disp3d() {
+    const obj = g_3dObj
+    if (!obj || !g_3dZbuf) return
+    const ctx = aaCtx()
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const X_S = imgW >> 1, Y_S = imgH >> 1
+    // XRATIO/YRATIO from tex.c: X_s*zoom/320 and Y_s*zoom*mmW/mmH/320. BB was
+    // tuned for 8×8 character cells where mmW/mmH ≈ scrW/scrH; on TSVM the
+    // cells are 7×14 (twice as tall as wide), so each image-buffer Y unit
+    // covers twice the physical distance of an X unit. Compensate by halving
+    // the Y projection scale — same 14/7 correction _aaDispimg applies to
+    // portraits. Without it the torus and patnik stretch vertically by 2×.
+    const XRATIO = imgW * g_zoom / 320
+    const YRATIO = imgH * g_zoom * ctx.mmW / (ctx.mmH * 2) / 320
+
+    // Normalise rotation angles into [0..360] for table indexing.
+    const aIdx = (((g_alfa | 0) % 360) + 360) % 360
+    const bIdx = (((g_beta | 0) % 360) + 360) % 360
+    const gIdx = (((g_gama | 0) % 360) + 360) % 360
+    const sinA = g_sinTab[aIdx], cosA = g_cosTab[aIdx]
+    const sinB = g_sinTab[bIdx], cosB = g_cosTab[bIdx]
+    const sinG = g_sinTab[gIdx], cosG = g_cosTab[gIdx]
+    const cx = g_centerx, cy = g_centery, cz = g_centerz
+
+    const ox = obj.ox, oy = obj.oy, oz = obj.oz
+    const onx = obj.onx, ony = obj.ony, onz = obj.onz
+    const rotX = g_3dRotX, rotY = g_3dRotY, rotZ = g_3dRotZ
+    const rotNx = g_3dRotNx, rotNy = g_3dRotNy
+    const N = obj.nFaces * 3
+
+    for (let i = 0; i < N; i++) {
+        // Position: rotate through alfa (Y axis), beta (X axis), gama (Z axis).
+        let x = ox[i] + cx, y = oy[i] + cy, z = oz[i] + cz
+        let rx = z * cosA - x * sinA
+        let rz = z * sinA + x * cosA
+        let tmp = y * cosB - rz * sinB
+        rz = y * sinB + rz * cosB
+        let ry = tmp
+        tmp = ry * cosG - rx * sinG
+        rx = ry * sinG + rx * cosG
+        ry = tmp
+        rotX[i] = rx; rotY[i] = ry; rotZ[i] = rz
+
+        // Normal — faithful to tex.c::disp3d, including the C "bug" where
+        // the β/γ stages reuse the POSITION's just-computed rotated z (rz
+        // here) instead of the normal's own z. n_z is never read by the
+        // env-map sampler, so we drop it after compute.
+        x = onx[i] + cx; y = ony[i] + cy; z = onz[i] + cz
+        let nrx = z * cosA - x * sinA
+        // (z' for normal is computed in C but immediately overwritten; skip.)
+        let ntmp = y * cosB - rz * sinB    // ← rz = position-z, exactly as C
+        let nry = ntmp
+        ntmp = nry * cosG - nrx * sinG
+        nrx  = nry * sinG + nrx * cosG
+        nry  = ntmp
+        rotNx[i] = nrx; rotNy[i] = nry
+    }
+
+    // Clear z-buffer (large positive value matches memset 0x55 → 0x55555555)
+    // and the image buffer. Clear only the visible 160×64 region — fill() is
+    // already optimal for typed arrays.
+    g_3dZbuf.fill(0x55555555)
+    ctx.imagebuffer.fill(0)
+
+    // Project + rasterise.
+    _3dShow(imgW, imgH, X_S, Y_S, XRATIO, YRATIO)
+}
+
+function _3dShow(imgW, imgH, X_S, Y_S, XRATIO, YRATIO) {
+    const obj = g_3dObj
+    const nFaces = obj.nFaces
+    const rotX = g_3dRotX, rotY = g_3dRotY, rotZ = g_3dRotZ
+    const polyX = g_3dPolyX, polyY = g_3dPolyY
+
+    for (let i = 0; i < nFaces * 3; i++) {
+        const rz = rotZ[i]
+        const div = 256 + rz
+        if (div === 0) { polyX[i] = 0; polyY[i] = 0; continue }
+        polyX[i] = ((rotX[i] * 256) / div * XRATIO + X_S) | 0
+        polyY[i] = ((rotY[i] * 256) / div * YRATIO + Y_S) | 0
+    }
+
+    for (let i = 0; i < nFaces; i++) {
+        const k0 = i * 3, k1 = k0 + 1, k2 = k0 + 2
+        const ZZ = (polyX[k2] - polyX[k0]) * (polyY[k1] - polyY[k0]) -
+                   (polyX[k1] - polyX[k0]) * (polyY[k2] - polyY[k0])
+        if (ZZ <= 0) _3dRasterise(i, imgW, imgH)
+    }
+}
+
+// _3dSpan — fill one scanline (x1..x2) at row ii. Per-pixel: lerp the rotated
+// normal x/y and the depth z; sample envmap; z-test with 500-unit slack.
+function _3dSpan(x1, x2, n1z, n2z, ii, n1x, n1y, n2x, n2y, imgW, imgH, data, env, zbuff) {
+    if (ii >= imgH || ii < 0 || x2 < 0 || x1 >= imgW) return
+    if (x1 < 0) x1 = 0
+    if (x2 >= imgW) x2 = imgW - 1
+    const e = x2 - x1
+    if (e <= 0) return
+    const dnx = (n2x - n1x) / e
+    const dny = (n2y - n1y) / e
+    const dnz = (n2z - n1z) / e
+    let nx = n1x, ny = n1y, nz = n1z
+    const base = ii * imgW
+    let off = base + x1
+    const end = base + x2
+    while (off <= end) {
+        const ay = (ny < 0 ? -ny : ny)
+        const ax = (nx < 0 ? -nx : nx)
+        let ry = ((ay / 128) | 0) + 64
+        let rx = ((ax / 128) | 0) + 64
+        const idx = (((ry << 7) + rx) & ((128 * 128) - 1))
+        const zi = (nz / 256) | 0
+        if ((zi - zbuff[off]) < 500) {
+            data[off] = env[idx]
+            zbuff[off] = zi
+        }
+        off++
+        nx += dnx; ny += dny; nz += dnz
+    }
+}
+
+// _3dRasterise — port of tex.c::optfsp. Sort vertices by y, walk top→mid and
+// mid→bottom, computing left/right edge per row and dispatching to _3dSpan.
+function _3dRasterise(face, imgW, imgH) {
+    const k0 = face * 3, k1 = k0 + 1, k2 = k0 + 2
+    const polyX = g_3dPolyX, polyY = g_3dPolyY
+    const rotZ  = g_3dRotZ
+    const rotNx = g_3dRotNx, rotNy = g_3dRotNy
+    const data  = aaCtx().imagebuffer
+    const env   = g_3dEnv
+    const zbuf  = g_3dZbuf
+
+    // Find pivot (min-y) and maxy.
+    let pivot = 0
+    if (polyY[k0 + pivot] > polyY[k1]) pivot = 1
+    if (polyY[k0 + pivot] > polyY[k2]) pivot = 2
+    let maxy = 0
+    if (polyY[k0 + maxy] < polyY[k1]) maxy = 1
+    if (polyY[k0 + maxy] < polyY[k2]) maxy = 2
+
+    let a = pivot, b = pivot, c = maxy
+    do { b = (b === 2) ? 0 : b + 1 } while (b === pivot || b === maxy)
+
+    const ka = k0 + a, kb = k0 + b, kc = k0 + c
+    const m1 = polyY[kc] - polyY[ka]
+    const m2 = polyY[kb] - polyY[ka]
+    const m3 = polyY[kc] - polyY[kb]
+
+    if (m1 === 0) return
+
+    // Long edge a→c (full triangle height).
+    const d1   = (polyX[kc] - polyX[ka]) / m1
+    let   x1   = polyX[ka]
+    const n1Dx = (rotNx[kc] - rotNx[ka]) / m1
+    let   n1x  = rotNx[ka]
+    const n1Dy = (rotNy[kc] - rotNy[ka]) / m1
+    let   n1y  = rotNy[ka]
+    const n1Dz = ((rotZ[kc] - rotZ[ka]) * 65536) / m1   // Z kept in Q16 fixed-point
+    let   n1z  = rotZ[ka] * 65536
+
+    if (m2) {
+        const d2   = (polyX[kb] - polyX[ka]) / m2
+        let   x2   = polyX[ka]
+        const n2Dx = (rotNx[kb] - rotNx[ka]) / m2
+        let   n2x  = rotNx[ka]
+        const n2Dy = (rotNy[kb] - rotNy[ka]) / m2
+        let   n2y  = rotNy[ka]
+        const n2Dz = ((rotZ[kb] - rotZ[ka]) * 65536) / m2
+        let   n2z  = rotZ[ka] * 65536
+        for (let ii = polyY[ka]; ii <= polyY[kb]; ii++) {
+            const aa = x1 | 0, bb = x2 | 0
+            if (aa > bb) _3dSpan(bb, aa, n2z, n1z, ii, n2x, n2y, n1x, n1y, imgW, imgH, data, env, zbuf)
+            else if (aa < bb) _3dSpan(aa, bb, n1z, n2z, ii, n1x, n1y, n2x, n2y, imgW, imgH, data, env, zbuf)
+            x1 += d1; x2 += d2
+            n1x += n1Dx; n1y += n1Dy; n1z += n1Dz
+            n2x += n2Dx; n2y += n2Dy; n2z += n2Dz
+        }
+    }
+    if (m3) {
+        const d2   = (polyX[kc] - polyX[kb]) / m3
+        let   x2   = polyX[kb]
+        const n2Dx = (rotNx[kc] - rotNx[kb]) / m3
+        let   n2x  = rotNx[kb]
+        const n2Dy = (rotNy[kc] - rotNy[kb]) / m3
+        let   n2y  = rotNy[kb]
+        const n2Dz = ((rotZ[kc] - rotZ[kb]) * 65536) / m3
+        let   n2z  = rotZ[kb] * 65536
+        for (let ii = polyY[kb] + 1; ii <= polyY[kc]; ii++) {
+            const aa = x1 | 0, bb = x2 | 0
+            if (aa > bb) _3dSpan(bb, aa, n2z, n1z, ii, n2x, n2y, n1x, n1y, imgW, imgH, data, env, zbuf)
+            else if (aa < bb) _3dSpan(aa, bb, n1z, n2z, ii, n1x, n1y, n2x, n2y, imgW, imgH, data, env, zbuf)
+            x1 += d1; x2 += d2
+            n1x += n1Dx; n1y += n1Dy; n1z += n1Dz
+            n2x += n2Dx; n2y += n2Dy; n2z += n2Dz
+        }
+    }
+}
+
+// ============================================================================
+// Text helpers used by scene5 — straight ports of scene2.c's pruježd /
+// levotoč / pravotoč / horotoč / lepic family. All operate on ctx.imagebuffer
+// via aa.print; bbDraw renders + flushes them to the screen alongside the 3D.
+// ============================================================================
+const _S5_LTIME  = 200000
+const _S5_ETIME2 = 1000000
+let _s5T = 0, _s5F = 0, _s5Xpos = 0, _s5Xpos1 = 0
+
+function initlepic() {
+    _s5T = 0
+    _s5F = 0
+    _s5Xpos = 0
+    _s5Xpos1 = 0
+}
+
+// ctrllepic — damped-spring text bounce. Called at -60 Hz from timestuff;
+// integrates xpos with gravity G and damping. After TTIME ticks the text
+// falls off the bottom via xpos1.
+const _S5_TTIME1 = 80
+const _S5_TTIME  = 100
+const _S5_G      = 0.02
+const _S5_AMP    = 40
+function ctrllepic(i) {
+    for (; i > 0; i--) {
+        _s5T++
+        _s5F += _S5_G
+        _s5F *= 0.96
+        if (_s5T < _S5_TTIME) {
+            if (_s5T < _S5_TTIME1) _s5F -= _s5Xpos / _S5_AMP
+            else                   _s5F -= _s5Xpos / _S5_AMP / 2
+            _s5Xpos += _s5F
+        } else {
+            _s5Xpos1 += _s5F
+            _s5Xpos  += _S5_G
+        }
+        if (_s5Xpos < 0) { _s5Xpos = 0; _s5F = -_s5F }
+    }
+}
+
+// drawlepic — bouncing-then-falling text. xpos is the height factor (1.0 =
+// fills screen); xpos1 is the post-fall vertical offset.
+function drawlepic(mesg) {
+    if (!mesg || mesg.length === 0) return
+    const ctx = aaCtx(), font = aaFont()
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    aa.print(ctx, 0, (_s5Xpos1 * imgH) | 0,
+             (imgW / mesg.length) | 0, (imgH * _s5Xpos) | 0,
+             font, 255, mesg)
+}
+
+// drawprujezd — text rolls right→left along a sinusoidally-bobbing height.
+function drawprujezd(mesg, starttime) {
+    if (!mesg || mesg.length === 0) return
+    const ctx = aaCtx(), font = aaFont()
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const STATE = (sysNow() / 1000) | 0  // µs since boot; only diffs are used below
+    const elapsed = STATE - starttime
+    const height = imgH / 3 + imgH / 4 * Math.cos(elapsed / _S5_LTIME)
+    const width  = imgW * 0.75 * 2.0 / 3.0 / 3
+    const pos    = imgW - width * elapsed / _S5_LTIME
+    aa.print(ctx, (pos + height) | 0, ((imgH - height) / 2) | 0,
+             width | 0, height | 0, font, 255, mesg)
+}
+
+// drawlevotoc — slide reveal L→R. Two texts share the screen: mesg grows from
+// the left, mesg1 shrinks off the right. Past ETIME2 only mesg shows.
+function drawlevotoc(mesg, mesg1, starttime) {
+    if (!mesg) mesg = ""
+    if (!mesg1) mesg1 = ""
+    const ctx = aaCtx(), font = aaFont()
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const STATE = (sysNow() / 1000) | 0
+    const elapsed = STATE - starttime
+    if (elapsed < _S5_ETIME2 && elapsed > 0) {
+        if (mesg.length)  aa.print(ctx, 0, 0,
+            ((imgW / mesg.length)  * (elapsed / _S5_ETIME2)) | 0, imgH, font, 255, mesg)
+        if (mesg1.length) aa.print(ctx, (imgW * (elapsed / _S5_ETIME2)) | 0, 0,
+            ((imgW / mesg1.length) * (1 - elapsed / _S5_ETIME2)) | 0, imgH, font, 255, mesg1)
+    } else if (elapsed >= _S5_ETIME2 && mesg.length) {
+        aa.print(ctx, 0, 0, (imgW / mesg.length) | 0, imgH, font, 255, mesg)
+    }
+}
+
+function drawpravotoc(mesg, mesg1, starttime) {
+    if (!mesg) mesg = ""
+    if (!mesg1) mesg1 = ""
+    const ctx = aaCtx(), font = aaFont()
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const STATE = (sysNow() / 1000) | 0
+    const elapsed = STATE - starttime
+    if (elapsed < _S5_ETIME2 && elapsed > 0) {
+        if (mesg1.length) aa.print(ctx, 0, 0,
+            ((imgW / mesg1.length) * (1 - elapsed / _S5_ETIME2)) | 0, imgH, font, 255, mesg1)
+        if (mesg.length)  aa.print(ctx, (imgW * (1 - elapsed / _S5_ETIME2)) | 0, 0,
+            ((imgW / mesg.length)  * (elapsed / _S5_ETIME2)) | 0, imgH, font, 255, mesg)
+    } else if (elapsed >= _S5_ETIME2 && mesg.length) {
+        aa.print(ctx, 0, 0, (imgW / mesg.length) | 0, imgH, font, 255, mesg)
+    }
+}
+
+function drawhorotoc(mesg, mesg1, starttime) {
+    if (!mesg) mesg = ""
+    if (!mesg1) mesg1 = ""
+    const ctx = aaCtx(), font = aaFont()
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const STATE = (sysNow() / 1000) | 0
+    const elapsed = STATE - starttime
+    if (elapsed < _S5_ETIME2 && elapsed > 0) {
+        if (mesg.length)  aa.print(ctx, 0, 0,
+            (imgW / mesg.length)  | 0, (imgH * (elapsed / _S5_ETIME2))     | 0, font, 255, mesg)
+        if (mesg1.length) aa.print(ctx, 0, (imgH * (elapsed / _S5_ETIME2)) | 0,
+            (imgW / mesg1.length) | 0, (imgH * (1 - elapsed / _S5_ETIME2)) | 0, font, 255, mesg1)
+    } else if (elapsed >= _S5_ETIME2 && mesg.length) {
+        aa.print(ctx, 0, 0, (imgW / mesg.length) | 0, imgH, font, 255, mesg)
+    }
+}
+
+// ============================================================================
+// SCENE 5 — torus + AA / dither / gamma demo. Near-verbatim port of scene5.c.
+//
+// Storyboard (top→bottom):
+//   "Supports"        : drawlepic bounce, helpbuffer-only torus (no AA shown)
+//   "ANTIALIASING"    : mydraw fades blocky→smooth bottom-up (aaval 0→sweep)
+//   ""                : mydraw fades AA back out
+//   "256 colors-ascii": mydraw1 — colour ramp from binary to greyscale
+//   PAUZICKA → "dithering" lepic
+//   PAUZICKA → "random" — params.randomval up then back down
+//   3×drawhorotoc "Error / distribution"; flip dither to AA_ERRORDISTRIB mid-segment
+//   3×drawlevotoc "Floyd-/Steinberg"; flip dither to AA_FLOYD_S
+//   3×drawpravotoc "Gamma / Correction"; gamma ramps 1 → 5 → 1
+//   PAUZICKA → STMIVAC (final centerx slide-out → black)
+//
+// The fade implementations (mydraw / mydraw1) blend the original helpbuffer
+// (pristine torus) with a "deantialiased" version where any non-zero pixel
+// becomes 255 (binary mask). Mul controls the AA-vs-binary mix per scanline.
 // ============================================================================
 function scene5() {
-    clearScreen()
-    const captions = [
-        "SUPPORTS", "ANTIALIASING", "256 COLOURS", "ASCII",
-        "DITHERING", "RANDOM", "ERROR", "DISTRIBUTION",
-        "FLOYD", "STEINBERG", "GAMMA", "CORRECTION",
-    ]
-    for (let i = 0; i < captions.length; i++) {
-        if (g_quit) return
-        const ok = runScene(850000, 30, function(el, dur) {
-            con.clear()
-            const t = el / dur
-            const sc = 1 + (((1 - Math.abs(t - 0.5) * 2) * 2) | 0)
-            const y = 4 + (((Math.sin(i * 1.2) + 1) * (TROWS - 8)) / 2 | 0)
-            bigText(y, captions[i], Math.max(1, sc))
-            for (let n = 0; n < 25; n++) {
-                const px = 1 + ((Math.random() * TCOLS) | 0)
-                const py = 1 + ((Math.random() * TROWS) | 0)
-                putCh(py, px, ".".charCodeAt(0))
+    const ctx = aaCtx()
+    const params = g_aaPar
+
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx); aa.clear(ctx)
+    params.bright    = 0
+    params.contrast  = 0
+    params.randomval = 0
+    params.gamma     = 1.0
+    params.dither    = aa.AA_NONE
+
+    // First-time set-up: alloc z-buffer, build torus mesh, render a still
+    // frame at α=0,β=90,γ=0 to seed `helpbuffer` — the pristine reference
+    // image the fade effects blend against.
+    set_zbuff()
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const helpbuffer = new Uint8Array(imgW * imgH)
+
+    g_alfa = 0; g_beta = 90; g_gama = 0
+    g_centerx = 0; g_centery = 0; g_centerz = 0
+    g_zoom = 1.5
+    torusconstructor()
+    disp3d()
+    helpbuffer.set(ctx.imagebuffer)
+
+    // Shared scene state.
+    let aaval = -1            // -1 = clrscr() in draw; ≥0 = blend mode active
+    let colorval = 0
+    let sstarttime = sysNow() / 1000 | 0
+    let textMain = "", textAux = ""
+    let segStart = sysNow() / 1000 | 0   // for drawprujezd's `starttime` arg
+
+    // do3d() — scene5's rotation update, mirroring scene5.c::do3d. Time-warped
+    // rotation: t = ((TIME-sstarttime)/30000/200)^1.3 * 200.
+    function do3d() {
+        const elapsed = ((sysNow() / 1000) | 0) - sstarttime
+        let t = Math.pow(elapsed / 30000 / 200.0, 1.3) * 200
+        if (t < 0) t = 0
+        let a = t | 0, b = (t | 0) + 90, c = t | 0
+        g_alfa = ((a % 360) + 360) % 360
+        g_beta = ((b % 360) + 360) % 360
+        g_gama = ((c % 360) + 360) % 360
+        disp3d()
+    }
+
+    // mydraw — antialias fade: per-scanline blend `mul` between the binary
+    // mask of helpbuffer (255 wherever the 2×2 helpbuffer patch had any ink)
+    // and helpbuffer itself. `mul` ramps from aaval down (bottom of screen
+    // sharpens first).
+    function mydraw() {
+        const pos = ctx.imagebuffer
+        const pos1 = helpbuffer
+        if (aaval >= 0) {
+            const W = imgW
+            for (let y = 0; y < imgH; y += 2) {
+                let mul = (-y) * 8 + aaval
+                if (mul < 0)   mul = 0
+                if (mul > 255) mul = 255
+                const inv = 255 - mul
+                const r0 = y * W, r1 = r0 + W
+                for (let x = 0; x < W; x += 2) {
+                    const i00 = r0 + x, i01 = i00 + 1
+                    const i10 = r1 + x, i11 = i10 + 1
+                    const any = pos1[i00] | pos1[i01] | pos1[i10] | pos1[i11]
+                    const acolor = any ? 255 : 0
+                    pos[i00] = ((pos1[i00] !== 0 ? 255 : 0) * mul + acolor * inv) >> 8
+                    pos[i01] = ((pos1[i01] !== 0 ? 255 : 0) * mul + acolor * inv) >> 8
+                    pos[i10] = ((pos1[i10] !== 0 ? 255 : 0) * mul + acolor * inv) >> 8
+                    pos[i11] = ((pos1[i11] !== 0 ? 255 : 0) * mul + acolor * inv) >> 8
+                }
             }
-        })
-        if (!ok) return
-    }
-    con.clear()
-}
-
-// ============================================================================
-// SCENE 7 — Mandelbrot tribute (XaoS)
-// ============================================================================
-function mandel(cx, cy, maxIter) {
-    let x = 0, y = 0, i = 0
-    while (i < maxIter) {
-        const x2 = x * x, y2 = y * y
-        if (x2 + y2 > 4) return i
-        const xy = x * y
-        x = x2 - y2 + cx
-        y = xy + xy + cy
-        i++
-    }
-    return maxIter
-}
-
-function renderMandel(cx, cy, zoom, maxIter) {
-    // Cell aspect (h:w ~ 2:1) — stretch x scale by 2 so the picture isn't squished.
-    const sx = (zoom * 2.5) / TCOLS
-    const sy = (zoom * 1.5) / TROWS
-    for (let py = 0; py < TROWS; py++) {
-        const fy = cy + (py - TROWS / 2) * sy
-        let row = ""
-        for (let px = 0; px < TCOLS; px++) {
-            const fx = cx + (px - TCOLS / 2) * sx
-            const it = mandel(fx, fy, maxIter)
-            if (it === maxIter) row += ' '
-            else row += RAMP.charAt(it % RAMP.length)
+        } else {
+            ctx.imagebuffer.fill(0)
         }
-        vramPutRow(py + 1, 1, row)
-        // Check input mid-render so a slow frame can still be skipped.
-        if (py % 6 === 5) { checkInput(); if (g_quit || g_skip) return }
+        drawprujezd(textMain, segStart)
     }
+
+    // mydraw1 — colour ramp. colorval 0 → binary mask; 255 → full luminance.
+    function mydraw1() {
+        const pos = ctx.imagebuffer
+        const pos1 = helpbuffer
+        const mul2 = 255 * (255 - colorval)
+        if (aaval >= 0) {
+            for (let i = 0; i < pos.length; i++) {
+                pos[i] = (pos1[i] * colorval + ((pos1[i] !== 0) ? mul2 : 0)) >> 8
+            }
+        } else {
+            pos.fill(0)
+        }
+        drawprujezd(textMain, segStart)
+    }
+
+    const mydraw2 = function() { do3d(); drawprujezd(textMain, segStart) }
+    const mydraw3 = function() { ctx.imagebuffer.fill(0); drawlepic(textMain) }
+    const mydraw4 = function() { do3d(); drawlepic(textMain) }
+    const mydraw5 = function() { do3d(); drawlevotoc(textMain, textAux, segStart) }
+    const mydraw6 = function() { do3d(); drawhorotoc(textMain, textAux, segStart) }
+    const mydraw7 = function() { do3d(); drawpravotoc(textMain, textAux, segStart) }
+    const mydraw8 = function() { do3d(); g_centerx = ((sysNow()/1000|0) - segStart) * 400 / 2000000 }
+
+    function pauzicka() {
+        g_drawptr = do3d
+        segStart = sysNow() / 1000 | 0
+        timestuff(0, null, bbDraw, 2 * 1000000)
+    }
+    function stmivac() {
+        segStart = sysNow() / 1000 | 0
+        g_drawptr = mydraw8
+        timestuff(0, null, bbDraw, 2 * 1000000)
+    }
+
+    // ── Storyboard ──────────────────────────────────────────────────────────
+    g_overlayText = ""
+
+    // "Supports" — drawlepic on a static dark frame. The torus isn't rendered
+    // here; the helpbuffer-only path means the screen stays mostly black with
+    // only the text bouncing in. Matches scene5.c::mydraw3.
+    textMain = "Supports"
+    g_drawptr = mydraw3
+    initlepic()
+    timestuff(-60, ctrllepic, bbDraw, 2 * 1000000)
+    if (g_quit) return
+
+    // "ANTIALIASING" — fade torus in via mydraw. aaval starts at 0 and is
+    // bumped by +7 per tick (decaaval). Sharpens bottom→top.
+    g_drawptr = mydraw
+    aaval = 0
+    textMain = "ANTIALIASING"
+    timestuff(60, null, bbDraw, 5 * 1000000)
+    if (g_quit) return
+
+    // Fade AA back out (decaaval = -7 per tick over 3 s).
+    textMain = ""
+    timestuff(-60, function(i) { aaval += 7 * i }, bbDraw, 3 * 1000000)
+    if (g_quit) return
+
+    // "256 colors-ascii" — colour ramp. inccolor maps elapsed/total to 0..255.
+    textMain = "256 colors-ascii"
+    colorval = 0
+    g_drawptr = mydraw1
+    {
+        const segStart0 = sysNow() / 1000 | 0
+        segStart = segStart0
+        timestuff(-60, function() {
+            const el = (sysNow() / 1000 | 0) - segStart0
+            colorval = (el * 256 / 6000000) | 0
+            if (colorval > 255) colorval = 255
+        }, bbDraw, 6 * 1000000)
+    }
+    if (g_quit) return
+
+    // From here on, the torus rotates via do3d(). sstarttime resets so the
+    // time-warp pow() exponent starts from zero — same as scene5.c.
+    sstarttime = sysNow() / 1000 | 0
+
+    pauzicka(); if (g_quit) return
+    initlepic()
+    textMain = "dithering"
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw4
+    timestuff(-60, ctrllepic, bbDraw, 2 * 1000000)
+    if (g_quit) return
+
+    pauzicka(); if (g_quit) return
+    textMain = "random"
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw2
+    {
+        const segStart0 = sysNow() / 1000 | 0
+        const totalUs = 3 * 1000000
+        timestuff(-60, function() {
+            const el = (sysNow() / 1000 | 0) - segStart0
+            if (el < totalUs / 2) {
+                params.randomval = (el * 256 / totalUs) | 0
+            } else {
+                params.randomval = ((totalUs - el) * 256 / totalUs) | 0
+            }
+            if (params.randomval < 0) params.randomval = 0
+            if (params.randomval > 255) params.randomval = 255
+        }, bbDraw, totalUs)
+    }
+    params.randomval = 0
+    if (g_quit) return
+
+    // Error-distribution dither — three 1 s panels with text wiping in
+    // vertically (drawhorotoc).
+    pauzicka(); if (g_quit) return
+    textAux = " "; textMain = "Error"
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw6
+    timestuff(60, null, bbDraw, 1 * 1000000)
+    if (g_quit) return
+    params.dither = aa.AA_ERRORDISTRIB
+
+    textAux = "Error"; textMain = "distribution"
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw6
+    timestuff(60, null, bbDraw, 1 * 1000000)
+    if (g_quit) return
+
+    textAux = "distribution"; textMain = " "
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw6
+    timestuff(60, null, bbDraw, 1 * 1000000)
+    if (g_quit) return
+    params.randomval = 0
+
+    // Floyd-Steinberg — three 1 s panels with text sliding L→R (drawlevotoc).
+    pauzicka(); if (g_quit) return
+    textAux = " "; textMain = "Floyd-"
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw5
+    timestuff(60, null, bbDraw, 1 * 1000000)
+    if (g_quit) return
+    params.dither = aa.AA_FLOYD_S
+
+    textAux = "Floyd-"; textMain = "Steinberg"
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw5
+    timestuff(60, null, bbDraw, 1 * 1000000)
+    if (g_quit) return
+
+    textAux = "Steinberg"; textMain = " "
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw5
+    timestuff(60, null, bbDraw, 1 * 1000000)
+    if (g_quit) return
+
+    // Gamma correction — three panels (drawpravotoc, text sliding R→L). gamma
+    // ramps 1 → 5 over panel 1, holds 5 over panel 2, then falls 5 → 1 over
+    // panel 3.
+    pauzicka(); if (g_quit) return
+    textAux = " "; textMain = "Gamma "
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw7
+    {
+        const segStart0 = sysNow() / 1000 | 0
+        const totalUs = 1 * 1000000
+        timestuff(-60, function() {
+            const el = (sysNow() / 1000 | 0) - segStart0
+            params.gamma = 1.0 + el * 4.0 / totalUs
+        }, bbDraw, totalUs)
+    }
+    if (g_quit) return
+    params.dither = aa.AA_FLOYD_S
+
+    textAux = "Gamma "; textMain = "Correction"
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw7
+    timestuff(60, null, bbDraw, 1 * 1000000)
+    if (g_quit) return
+
+    textAux = "Correction"; textMain = " "
+    segStart = sysNow() / 1000 | 0
+    g_drawptr = mydraw7
+    {
+        const segStart0 = sysNow() / 1000 | 0
+        const totalUs = 1.5 * 1000000
+        timestuff(-60, function() {
+            const el = (sysNow() / 1000 | 0) - segStart0
+            params.gamma = 1.0 + (totalUs - el) * 4.0 / totalUs
+        }, bbDraw, totalUs)
+    }
+    params.gamma = 1.0
+    if (g_quit) return
+
+    pauzicka(); if (g_quit) return
+    stmivac()
+    g_centerx = 0
+    g_drawptr = null
 }
 
-function scene6() {
-    clearScreen()
-    const KF = [
-        { cx: -0.5,         cy:  0.0,    zoom: 1.5,    iter: 18, label: "XaoS - the fast portable realtime fractal zoomer" },
-        { cx: -0.745,       cy:  0.113,  zoom: 0.4,    iter: 28, label: "MANDELBROT SET, z := z^2 + c" },
-        { cx: -0.7453,      cy:  0.1127, zoom: 0.06,   iter: 40, label: "DEEPER..." },
-        { cx: -0.74543,     cy:  0.11301,zoom: 0.012,  iter: 55, label: "...DEEPER" },
-        { cx: -0.16,        cy:  1.04,   zoom: 0.3,    iter: 35, label: "JULIA-LIKE SPIRAL" },
-        { cx:  0.275,       cy:  0.005,  zoom: 0.05,   iter: 60, label: "FINE STRUCTURE" },
-        { cx: -0.5,         cy:  0.0,    zoom: 2.0,    iter: 22, label: "...AND BACK" },
-    ]
-    for (let k = 0; k < KF.length; k++) {
-        if (g_quit) return
-        const f = KF[k]
-        renderMandel(f.cx, f.cy, f.zoom, f.iter)
-        if (g_quit || g_skip) { g_skip = false; continue }
-        setBG(BLACK); setFG(WHITE)
-        drawText(TROWS, 2, f.label)
-        if (!waitMs(1900)) return
+// ============================================================================
+// SCENE 6 / SCENE 7 — real-time fractal zoomer (port of scene7.c)
+//
+// Original was the XaoS engine running through `do_fractal()` (Mandelbrot,
+// scene6) and `do_julia()` (Julia, scene7), both feeding aalib's render
+// pipeline. We re-implement the iterations directly per pixel rather than
+// porting XaoS's subpixel-reuse zoomer, which is too heavy for TSVM JS —
+// at 160×64 imgbuf, naive per-pixel recompute is in the 5–20 fps range,
+// which is enough to feel zoomy.
+//
+// Iteration kernel:
+//   • |z|² > 4 early-exit (per the C source — once |z| ≥ 2 the orbit is
+//     guaranteed to escape, so further iterations are wasted compute).
+//   • Mandelbrot only: cardioid + period-2-bulb skips. These catch the two
+//     biggest "inset" regions in O(1), saving the full maxiter loop for
+//     the ~30 % of pixels that fall inside them at full-view zoom.
+//
+// Aspect compensation:
+//   TSVM cells are 7×14 px so imgbuf pixels are 3.5×7 px — one y-pixel
+//   covers twice the physical distance of one x-pixel. With imgW/imgH = 2.5,
+//   a math-square region needs to be rendered 1.25× wider than tall to
+//   look square on screen. So horizontal half-extent = 1.25·sc, vertical = sc.
+//
+// Output luminance ∈ [1, 255] for escaped pixels (cycled via i·k mod 256,
+// LSB forced to 1 so it can't accidentally hit 0); 0 for inset. The
+// per-scene multiplier (8 / 15) mirrors zcontext->colors[i] = (i*8)%255+1
+// / (i*15)%255+1 from the C source.
+// ============================================================================
+
+function _fractalMandelToBuf(ctx, cx, cy, sc, maxiter) {
+    const buf  = ctx.imagebuffer
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const sx = (sc * 2.5) / imgW
+    const sy = (sc * 2.0) / imgH
+    const x0 = cx - sc * 1.25
+    const y0 = cy - sc
+    for (let py = 0; py < imgH; py++) {
+        const cyP   = y0 + py * sy
+        const cyP2  = cyP * cyP
+        const rowOff = py * imgW
+        for (let px = 0; px < imgW; px++) {
+            const cxP = x0 + px * sx
+            // Cardioid skip: q·(q + (x−¼)) < y²/4 ⇒ guaranteed inset
+            const xm = cxP - 0.25
+            const q  = xm * xm + cyP2
+            if (q * (q + xm) < 0.25 * cyP2) { buf[rowOff + px] = 0; continue }
+            // Period-2 bulb skip: (x+1)² + y² < 1/16 ⇒ guaranteed inset
+            const xp = cxP + 1
+            if (xp * xp + cyP2 < 0.0625) { buf[rowOff + px] = 0; continue }
+            let zx = 0, zy = 0, i = 0
+            while (i < maxiter) {
+                const zx2 = zx * zx, zy2 = zy * zy
+                if (zx2 + zy2 > 4) break
+                zy = (zx + zx) * zy + cyP
+                zx = zx2 - zy2 + cxP
+                i++
+            }
+            buf[rowOff + px] = (i >= maxiter) ? 0 : (((i * 8) & 0xFE) | 1)
+        }
+        if ((py & 7) === 7) { checkInput(); if (g_quit || g_skip) return false }
     }
+    return true
+}
+
+function _fractalJuliaToBuf(ctx, cre, cim, sc, maxiter) {
+    const buf  = ctx.imagebuffer
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const sx = (sc * 2.5) / imgW
+    const sy = (sc * 2.0) / imgH
+    const x0 = -sc * 1.25
+    const y0 = -sc
+    for (let py = 0; py < imgH; py++) {
+        const zy0 = y0 + py * sy
+        const rowOff = py * imgW
+        for (let px = 0; px < imgW; px++) {
+            let zx = x0 + px * sx
+            let zy = zy0
+            let i = 0
+            while (i < maxiter) {
+                const zx2 = zx * zx, zy2 = zy * zy
+                if (zx2 + zy2 > 4) break
+                zy = (zx + zx) * zy + cim
+                zx = zx2 - zy2 + cre
+                i++
+            }
+            buf[rowOff + px] = (i >= maxiter) ? 0 : (((i * 15) & 0xFE) | 1)
+        }
+        if ((py & 7) === 7) { checkInput(); if (g_quit || g_skip) return false }
+    }
+    return true
+}
+
+// Autopilot — port of autopilo.c::do_autopilot. Pick a random LOOKSIZE-
+// radius patch and count inset pixels (luminance 0). Two phases:
+//   Phase 1 (strict): 0 < c ≤ patchArea/2 — patch straddles the boundary
+//     biased toward the outside (more outset than inset). Ideal zoom target.
+//   Phase 2 (loose):  0 < c < patchArea   — any non-uniform patch. Falls
+//     back when the view has zoomed past most of the boundary; still has
+//     mixed content somewhere, just less of it.
+// Returns null only when the view is fully uniform (all-inset or all-outset)
+// — the caller treats that as "stuck" and reverses zoom direction. LOOKSIZE
+// = 2 (5×5 patch) and NGUESSES1 = 40 match config.h.
+function _autopilotPick(ctx, lookSize, maxTries) {
+    const buf = ctx.imagebuffer
+    const imgW = ctx.imgW, imgH = ctx.imgH
+    const L = lookSize
+    const patchArea = (2 * L + 1) * (2 * L + 1)
+    const halfArea  = patchArea >> 1
+    // Phase 1
+    for (let tries = 0; tries < maxTries; tries++) {
+        const x = L + ((Math.random() * (imgW - 2 * L)) | 0)
+        const y = L + ((Math.random() * (imgH - 2 * L)) | 0)
+        let c = 0
+        for (let j = y - L; j <= y + L; j++) {
+            const row = j * imgW
+            for (let i = x - L; i <= x + L; i++) {
+                if (buf[row + i] === 0) c++
+            }
+        }
+        if (c > 0 && c <= halfArea) return { px: x, py: y }
+    }
+    // Phase 2
+    for (let tries = 0; tries < maxTries; tries++) {
+        const x = L + ((Math.random() * (imgW - 2 * L)) | 0)
+        const y = L + ((Math.random() * (imgH - 2 * L)) | 0)
+        let c = 0
+        for (let j = y - L; j <= y + L; j++) {
+            const row = j * imgW
+            for (let i = x - L; i <= x + L; i++) {
+                if (buf[row + i] === 0) c++
+            }
+        }
+        if (c > 0 && c < patchArea) return { px: x, py: y }
+    }
+    return null
+}
+
+// Outro phase A — "Zoomed" bouncing in. Port of scene2.c::ctrllepic +
+// drawlepic. ctrllepic integrates a damped spring (xpos) with gravity G;
+// for ticks 0..TTIME the spring oscillates about 0, then "lets go" and
+// the text falls off the bottom via xpos1. drawlepic uses xpos as the
+// vertical text height (so the caption stretches and squashes as it
+// bounces) and xpos1 as the y-offset.
+function _scene6DrawZoomed(durUs) {
+    const ctx  = aaCtx()
+    const font = aaFont()
+    const imgW = aa.imgwidth(ctx), imgH = aa.imgheight(ctx)
+    const mesg = "Zoomed"
+    let t = 0, f = 0, xpos = 0, xpos1 = 0
+    const G = 0.02, AMP = 40
+    const TTIME = 100, TTIME1 = 80
+
+    g_drawptr = function() {
+        aa.clear(ctx)
+        if (xpos > 0 && xpos1 < 1) {
+            const w = (imgW / mesg.length) | 0
+            const h = (imgH * xpos) | 0
+            const y = (xpos1 * imgH) | 0
+            if (w > 0 && h > 0) aa.print(ctx, 0, y, w, h, font, 255, mesg)
+        }
+    }
+    const ok = timestuff(-60, function(n) {
+        for (; n; n--) {
+            t++
+            f += G
+            f *= 0.96
+            if (t < TTIME) {
+                if (t < TTIME1) f -= xpos / AMP
+                else            f -= xpos / AMP / 2
+                xpos += f
+            } else {
+                xpos1 += f
+                xpos += G
+            }
+            if (xpos < 0) { xpos = 0; f = -f }
+        }
+    }, bbDraw, durUs)
+    g_drawptr = null
+    return ok
+}
+
+// Outro phase B — port of scene2.c::dvojprujezd. Zoom-factor number slides
+// L→R across the top third while "Times" slides R→L across the bottom third
+// (well, top vs bottom is swapped in dvojprujezd vs dvojprujezd2 — this is
+// the dvojprujezd variant, matching scene7.c).
+function _scene6DrawTimes(zoomFactor, durUs) {
+    const ctx  = aaCtx()
+    const font = aaFont()
+    const imgW = aa.imgwidth(ctx), imgH = aa.imgheight(ctx)
+    const text1 = "Times"
+    const text2 = zoomFactor.toFixed(2)
+    const phaseStart = sysNow()
+    g_drawptr = function() {
+        const STATE = ((sysNow() - phaseStart) / 1000) | 0
+        aa.clear(ctx)
+        const w = bbGetwidth(ctx, 2)
+        let p = w * text1.length + 1
+        _s1Centerprint(ctx, font,
+            -p / 2 + (imgW + p * 1.2) * STATE / durUs,
+            2 * imgH / 3, 2, 255, text1)
+        p = w * text2.length + 1
+        _s1Centerprint(ctx, font,
+            imgW + p / 2 - (imgW + p * 1.2) * STATE / durUs,
+            imgH / 3, 2, 255, text2)
+    }
+    const ok = timestuff(60, null, bbDraw, durUs)
+    g_drawptr = null
+    return ok
+}
+
+// scene6 — Mandelbrot real-time zoom with autopilot. Each frame the
+// autopilot picks (or re-uses) a boundary-straddling pixel target, the
+// view is zoomed exponentially toward its math-coord while cx/cy slide
+// proportionally. maxiter ramps with log(startSc/sc) so cheap wide views
+// stay snappy but deep views get the iteration budget they need.
+function scene6() {
+    const ctx    = aaCtx()
+    const params = g_aaPar
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx); aa.clear(ctx)
+
+    params.dither    = aa.AA_FLOYD_S
+    params.bright    = -255
+    params.contrast  = 0
+    params.randomval = 0
+    g_drawptr     = null
+    g_overlayText = ""
+
+    // Initial view: classic Mandelbrot overview, slight horizontal off-centre
+    // so the cardioid is visible in the framing.
+    const startCx = -0.5, startCy = 0.0, startSc = 1.30
+    let cx = startCx, cy = startCy, sc = startSc
+
+    // Autopilot state — pixel target persists for 1.0–2.5 s, then re-pick.
+    let tgtCx = cx, tgtCy = cy
+    let tgtExpiry = 0
+    let havePrevFrame = false
+    let zoomSign = -1               // -1 = zoom in, +1 = zoom out (when stuck)
+    let stuckUntil = 0              // µs — keep zooming out until this time
+    const LOOKSIZE = 2
+    const NGUESSES = 40
+    const ZOOM_RATE = 0.55          // log-units / sec → halves every ln2/0.55 ≈ 1.26 s
+
+    const totalUs   = 20 * 1000000
+    const fadeInUs  =  1 * 1000000
+    const fadeOutUs =  1 * 1000000
+    g_skip = false
+    const start = sysNow()
+    let lastFrameNs = start
+
+    while (true) {
+        if (g_quit) break
+        const now = sysNow()
+        const elUs = ((now - start) / 1000) | 0
+        if (elUs >= totalUs) break
+        if (g_skip) break
+        const dtSec = (now - lastFrameNs) / 1e9
+        lastFrameNs = now
+
+        if (elUs < fadeInUs)
+            params.bright = -255 + ((elUs * 255 / fadeInUs) | 0)
+        else if (elUs > totalUs - fadeOutUs)
+            params.bright = -(((elUs - (totalUs - fadeOutUs)) * 255 / fadeOutUs) | 0)
+        else
+            params.bright = 0
+
+        // Re-pick target if expired; uses the imagebuffer rendered with the
+        // CURRENT (cx, cy, sc), so the picked pixel correctly back-projects
+        // to a math coord under the same view.
+        if (havePrevFrame && elUs >= tgtExpiry) {
+            const t = _autopilotPick(ctx, LOOKSIZE, NGUESSES)
+            if (t) {
+                const sxp = (sc * 2.5) / ctx.imgW
+                const syp = (sc * 2.0) / ctx.imgH
+                tgtCx = cx - sc * 1.25 + t.px * sxp
+                tgtCy = cy - sc + t.py * syp
+                tgtExpiry = elUs + 1000000 + ((Math.random() * 1500000) | 0)
+                zoomSign = -1                            // resume zoom-in
+            } else {
+                // View is fully uniform (all-inset or all-outset) — back out
+                // for ~1.5 s so the boundary comes back into frame.
+                zoomSign  = +1
+                stuckUntil = elUs + 1500000
+                tgtExpiry  = elUs + 300000
+            }
+        }
+        // Re-arm zoom-in if the stuck-out interval elapsed.
+        if (zoomSign > 0 && elUs >= stuckUntil) {
+            zoomSign  = -1
+            tgtExpiry = elUs                            // pick immediately
+        }
+
+        // Exponential zoom toward (or away from) target. Equivalent to the C
+        // mc/nc/mi/ni multiplicative shift around (tgtCx, tgtCy): cx ← tgt +
+        // (cx−tgt)·z, sc ← sc·z. Clamp sc to avoid double-precision blow-up
+        // (deep zoom hits floor ≈1e-13) or going wider than the start view
+        // when stuck-out.
+        const z = Math.exp(zoomSign * ZOOM_RATE * dtSec * (zoomSign < 0 ? 1 : 0.8))
+        cx = tgtCx + (cx - tgtCx) * z
+        cy = tgtCy + (cy - tgtCy) * z
+        sc *= z
+        if (sc < 1e-13)  sc = 1e-13
+        if (sc > startSc) sc = startSc
+
+        // maxiter ramp: every doubling of zoom adds ~12 iter, capped at 220.
+        const depth   = Math.log(startSc / sc) / Math.LN2
+        let   maxiter = (48 + depth * 12) | 0
+        if (maxiter < 48) maxiter = 48
+        if (maxiter > 220) maxiter = 220
+
+        if (!_fractalMandelToBuf(ctx, cx, cy, sc, maxiter)) break
+        havePrevFrame = true
+
+        aa.render(ctx, g_aaPar)
+        bbOverlay()
+        aa.flush(ctx)
+        checkInput()
+    }
+
+    // ── Outro: "Zoomed" bounce-in (2 s) then "xxxx.xx Times" slide (3 s) ──
+    const zoomFactor = startSc / sc
+    if (!g_quit && !g_skip) {
+        params.bright = 0
+        _scene6DrawZoomed(2 * 1000000)
+    }
+    if (!g_quit && !g_skip) {
+        _scene6DrawTimes(zoomFactor, 3 * 1000000)
+    }
+
+    params.bright = 0
+    g_skip = false
     con.clear()
 }
 
+// scene7 — Julia c-parameter animation. Four 2-second phases sweeping the
+// c value through (re, im) space; first phase fades from black, last fades
+// back to black — mirrors scene7.c::scene7's sef/eef envelope.
 function scene7() {
-    clearScreen()
-    // scene6() but Julia set
+    const ctx    = aaCtx()
+    const params = g_aaPar
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx); aa.clear(ctx)
+
+    params.dither    = aa.AA_NONE
+    params.bright    = -255
+    params.contrast  = 0
+    params.randomval = 0
+    g_drawptr     = null
+    g_overlayText = ""
+
+    const phases = [
+        { rs: -2, is: -2, re:  2, ie:  2, sef: 1, eef: 0 },
+        { rs:  2, is:  2, re: -2, ie:  0, sef: 0, eef: 0 },
+        { rs: -2, is:  0, re:  2, ie:  0, sef: 0, eef: 0 },
+        { rs:  2, is:  0, re: -5, ie: -1, sef: 0, eef: 1 },
+    ]
+    const PHASE_US = 2 * 1000000
+    const FADE_US  = 200 * 1000
+    g_skip = false
+
+    for (let ph = 0; ph < phases.length; ph++) {
+        if (g_quit) break
+        const P = phases[ph]
+        const start = sysNow()
+        let inner = true
+        while (inner) {
+            if (g_quit) break
+            const elUs = ((sysNow() - start) / 1000) | 0
+            if (elUs >= PHASE_US) break
+            if (g_skip) break
+
+            if (P.sef && elUs < FADE_US)
+                params.bright = -255 + ((elUs * 255 / FADE_US) | 0)
+            else if (P.eef && elUs > PHASE_US - FADE_US)
+                params.bright = -(((elUs - (PHASE_US - FADE_US)) * 255 / FADE_US) | 0)
+            else
+                params.bright = 0
+
+            const t = elUs / PHASE_US
+            const cre = P.rs + (P.re - P.rs) * t
+            const cim = P.is + (P.ie - P.is) * t
+
+            if (!_fractalJuliaToBuf(ctx, cre, cim, 2.0, 96)) { inner = false; break }
+
+            aa.render(ctx, g_aaPar)
+            bbOverlay()
+            aa.flush(ctx)
+            checkInput()
+        }
+        if (g_skip) { g_skip = false; break }
+    }
+
+    params.bright = 0
+    params.dither = aa.AA_FLOYD_S
+    g_skip = false
     con.clear()
 }
 
@@ -1579,60 +2618,139 @@ function scene8() {
 }
 
 // ============================================================================
-// SCENE 9/10 — wireframe cube (substitute for 3D-torus / patnik)
+// SCENE 10 — patnik (the head model) with rotation. Near-verbatim port of
+// scene9.c::scene10. Storyboard:
+//   1. Strobik-flash through 4 fixed angles (α = 90, 0, 180, 270, β=0, γ=180).
+//      Each card is held 500 ms; first card sets up zoom=3, centery=-40.
+//   2. do3d() animations interpolating start/end keyframes with a poww-shaped
+//      eased curve. Each segment ends with start = end so the next picks up
+//      where the previous left off.
+//
+// Keyframe state: salpha/sbeta/sgamma/scenterx/y/z/szoom (start) and
+// ealpha/ebeta/egamma/ecenterx/y/z/ezoom (end). poww shapes the lerp:
+//   mul1 = (elapsed / total) ^ poww, mul2 = 1 - mul1
+// so poww<1 front-loads motion and poww>1 back-loads it.
 // ============================================================================
-function scene910() {
-    clearScreen()
-    const okCube = runScene(6500000, 18, function(el) {
-        con.clear()
-        const t = el / 200000
-        const V = [
-            [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
-            [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1],
-        ]
-        const E = [
-            [0,1],[1,2],[2,3],[3,0],
-            [4,5],[5,6],[6,7],[7,4],
-            [0,4],[1,5],[2,6],[3,7],
-        ]
-        const sa = Math.sin(t * 0.013), ca = Math.cos(t * 0.013)
-        const sb = Math.sin(t * 0.011), cb = Math.cos(t * 0.011)
-        const proj = []
-        for (let i = 0; i < V.length; i++) {
-            const x = V[i][0], y = V[i][1], z = V[i][2]
-            const x1 = x * ca - z * sa
-            const z1 = x * sa + z * ca
-            const y2 = y * cb - z1 * sb
-            const z2 = y * sb + z1 * cb
-            const d  = 3 + z2
-            proj[i] = [
-                ((x1 / d) * TCOLS * 0.7 + TCOLS / 2) | 0,
-                ((y2 / d) * TROWS * 1.5 + TROWS / 2) | 0,
-            ]
-        }
-        for (let i = 0; i < E.length; i++) {
-            const a = proj[E[i][0]], b = proj[E[i][1]]
-            let x0 = a[0], y0 = a[1]
-            const x1 = b[0], y1 = b[1]
-            const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1
-            const dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1
-            let err = dx + dy
-            for (let safety = 0; safety < 200; safety++) {
-                putCh(y0 + 1, x0 + 1, 0xDB)
-                if (x0 === x1 && y0 === y1) break
-                const e2 = 2 * err
-                if (e2 >= dy) { err += dy; x0 += sx }
-                if (e2 <= dx) { err += dx; y0 += sy }
-            }
-        }
-        const cap = (el < 1500000) ? "3D ENGINE"
-                  : (el < 3000000) ? "ROTATING CUBE"
-                  : (el < 4500000) ? "PSEUDO 3D"
-                  :                  "TEXT MODE!"
-        bigText(TROWS - 3, cap, 1)
-    })
-    if (!okCube) return
-    con.clear()
+function scene10() {
+    const ctx = aaCtx()
+    const params = g_aaPar
+
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx); aa.clear(ctx)
+    params.bright    = 0
+    params.contrast  = 0
+    params.randomval = 0
+    params.gamma     = 1.0
+    params.dither    = aa.AA_NONE
+
+    set_zbuff()
+    patnikconstructor()
+
+    // Keyframe state — start (s*) and end (e*).
+    let salpha = 0, sbeta = 0, sgamma = 0
+    let scenterx = 0, scentery = 0, scenterz = 0
+    let szoom = 0
+    let ealpha = 0, ebeta = 0, egamma = 0
+    let ecenterx = 0, ecentery = 0, ecenterz = 0
+    let ezoom = 0
+    let poww = 1
+
+    // draw3d() — invoked by timestuff as the per-frame draw. Computes
+    // alfa/beta/gama/centerx/y/z/zoom by interpolating s→e through poww.
+    // segStart is set immediately before each timestuff so we know when this
+    // segment began (in µs since boot).
+    let segStartUs = sysNow() / 1000 | 0
+    let segDurUs   = 1
+    function draw3d() {
+        const time = (sysNow() / 1000 | 0)
+        const div = segDurUs
+        let mul1 = Math.pow((time - segStartUs) / div, poww)
+        let mul2 = 1 - mul1
+        if (mul2 < 0) { mul1 = 1; mul2 = 0 }
+        if (mul1 < 0) { mul2 = 1; mul1 = 0 }
+        const aV = (salpha * mul2 + ealpha * mul1) | 0
+        const bV = (sbeta  * mul2 + ebeta  * mul1) | 0
+        const gV = (sgamma * mul2 + egamma * mul1) | 0
+        g_alfa = ((aV % 360) + 360) % 360
+        g_beta = ((bV % 360) + 360) % 360
+        g_gama = ((gV % 360) + 360) % 360
+        g_centerx = scenterx * mul2 + ecenterx * mul1
+        g_centery = scentery * mul2 + ecentery * mul1
+        g_centerz = scenterz * mul2 + ecenterz * mul1
+        g_zoom    = szoom    * mul2 + ezoom    * mul1
+        disp3d()
+        aa.render(ctx, params)
+        aa.flush(ctx)
+    }
+
+    // do3d(timeUs) — fire one animation segment, then promote end→start so
+    // the next segment continues smoothly. Exactly scene9.c::do3d.
+    function do3d(timeUs) {
+        segStartUs = sysNow() / 1000 | 0
+        segDurUs   = timeUs
+        timestuff(0, null, draw3d, timeUs)
+        ealpha = ((ealpha % 360) + 360) % 360
+        ebeta  = ((ebeta  % 360) + 360) % 360
+        egamma = ((egamma % 360) + 360) % 360
+        salpha = ealpha; sbeta = ebeta; sgamma = egamma
+        szoom    = ezoom
+        scenterx = ecenterx; scentery = ecentery; scenterz = ecenterz
+    }
+
+    // ── Strobik flash sequence (4 angles) ───────────────────────────────────
+    g_drawptr = null
+    g_overlayText = ""
+    params.gamma = 1
+    g_centery = -40
+    strobikstart()
+    g_zoom = 3
+    g_alfa = 90; g_beta = 0; g_gama = 180
+    disp3d()
+    aa.render(ctx, params)
+    strobikend()
+    if (!bbwait(500000)) return
+
+    strobikstart()
+    g_alfa = 0
+    disp3d()
+    aa.render(ctx, params)
+    strobikend()
+    if (!bbwait(500000)) return
+
+    strobikstart()
+    g_alfa = 180
+    disp3d()
+    aa.render(ctx, params)
+    strobikend()
+    if (!bbwait(500000)) return
+
+    strobikstart()
+    g_alfa = 270
+    disp3d()
+    aa.render(ctx, params)
+    strobikend()
+    if (g_quit) return
+
+    // ── Animation keyframes ─────────────────────────────────────────────────
+    salpha = 270; sbeta = 0; sgamma = 180; szoom = 3; scentery = -40
+    ealpha = 360 + 90; ebeta = 0; egamma = 180; ezoom = 3; ecentery = -40
+    do3d(4 * 1000000); if (g_quit) return
+
+    poww = 3
+    ezoom = 2; ebeta = 90; ecenterz = 60; ecentery = 50
+    do3d(3 * 1000000); if (g_quit) return
+
+    poww = 0.4; ebeta = 60
+    do3d(0.5 * 1000000); if (g_quit) return
+
+    poww = 5; ebeta = 90
+    do3d(0.5 * 1000000); if (g_quit) return
+
+    poww = 2; ecenterz = 0; ecenterx = 60; ebeta = 0; egamma = 180 * 5; ezoom = 0.1
+    do3d(11.5 * 1000000); if (g_quit) return
+
+    params.gamma = 1
+    g_drawptr = null
 }
 
 // ============================================================================
@@ -2036,7 +3154,7 @@ function credits() {
 // ============================================================================
 function closingLogo() {
     clearScreen()
-    loadSong(BB_DIR + "bb3.taud"); startMusic()
+    // loadSong(BB_DIR + "bb3.taud"); startMusic() // we'll just show the animated logo then quit. Even in the "real" version.
 
     // Build a vertical "8 8" growing from below.
     const LOGOH = 7
@@ -2116,7 +3234,7 @@ function main() {
     devezen1()          // two-buffer scroll wipe
     scene7();           if (g_quit) return
     scene5();           if (g_quit) return
-    scene910();         if (g_quit) return
+    scene10();         if (g_quit) return
     vezen("hh");        if (g_quit) return
     messager(BIO_HH);   if (g_quit) return
     devezen4()          // drop contrast then white-out
