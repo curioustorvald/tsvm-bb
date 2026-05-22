@@ -614,9 +614,10 @@ function scene1() {
     // ── drawwait4: two mirrored B's drifting on a damped harmonic ──────────
     const drawwait4 = function() {
         aa.clear(ctx)
+        const closeTogether = 14
         const size = 1.1 + s1_delta / 2
-        _s1Centerprint(ctx, font, imgW / 4 - s1_dist * imgW,        s1_pos,         size, 255, "B")
-        _s1Centerprint(ctx, font, 3 * imgW / 4 + s1_dist * imgW,    imgH - s1_pos,  size, 255, "B")
+        _s1Centerprint(ctx, font, imgW / 4 - s1_dist * imgW + closeTogether,        s1_pos,         size, 255, "B")
+        _s1Centerprint(ctx, font, 3 * imgW / 4 + s1_dist * imgW - closeTogether,    imgH - s1_pos,  size, 255, "B")
     }
 
     const hlaska = function(t, sz) {
@@ -627,9 +628,9 @@ function scene1() {
         const blText = [
             "the","100 %","TSVM","COMPATIBLE","DEMO",";^D","(^;",
             "FULL","80-COL","TEXT","MODE","",
-            "DEVELOPED","UNDER","TVDOS","!","!","!","?",
+            "DEVELOPED","UNDER","openSUSE","!","!","!","?",
         ]
-        const blSize = [3,3.5,3.5,4.6,3,2,2,3,3,3,3,1,4.4,3,3,1.5,2.2,3,4.2]
+        const blSize = [3,3.5,3.5,4.6,3,2,2,3,3,3,3,1,4.4,3,4,1.5,2.2,3,4.2]
         for (let i = 0; i < blText.length; i++) {
             if (g_quit || g_skip) { g_skip = false; return }
             strobikstart()
@@ -787,6 +788,8 @@ function scene2() {
         timestuff(0, null, bbDraw, itemDur)
     }
     g_drawptr = null
+
+    waitMs(300) // TSVM timing fix
 }
 
 // ============================================================================
@@ -921,7 +924,7 @@ function scene3() {
     // Initial half-second pause to match `bbwait(500000)`.
     // which is adjusted for TSVM timing
     // or put global multiplier to waitMs(), the typewriter is also sluggish
-    if (!waitMs(300)) return
+    if (!waitMs(500)) return
 
     runScene(_PLASMA_DUR_US, _PLASMA_FRAMERATE, function(elapsed, total) {
         // ── do_plasma(step=1) ────────────────────────────────────────────
@@ -1252,6 +1255,8 @@ function scene4() {
 
     // Restore the original image buffer so subsequent scenes see a sane size.
     ctx.imagebuffer = origBuf
+
+    waitMs(50) // TSVM timing fix
 }
 
 // ============================================================================
@@ -1819,12 +1824,12 @@ function scene5() {
     function pauzicka() {
         g_drawptr = do3d
         segStart = sysNow() / 1000 | 0
-        timestuff(0, null, bbDraw, 2 * 1000000)
+        timestuff(0, null, bbDraw, 2 * 1000000 + 140000) // TSVM timing fix
     }
     function stmivac() {
         segStart = sysNow() / 1000 | 0
         g_drawptr = mydraw8
-        timestuff(0, null, bbDraw, 2 * 1000000)
+        timestuff(0, null, bbDraw, 2 * 1000000 + 200000)  // TSVM timing fix
     }
 
     // ── Storyboard ──────────────────────────────────────────────────────────
@@ -2231,7 +2236,8 @@ function scene6() {
     const NGUESSES = 40
     const ZOOM_RATE = 0.55          // log-units / sec → halves every ln2/0.55 ≈ 1.26 s
 
-    const totalUs   = 20 * 1000000
+    const tsvmTimingFix = 650 * 1000 // TSVM timing fix
+    const totalUs   = 25 * 1000000 + 150000 + tsvmTimingFix
     const fadeInUs  =  1 * 1000000
     const fadeOutUs =  1 * 1000000
     g_skip = false
@@ -2615,6 +2621,8 @@ function scene8() {
     params.contrast = 0
     g_drawptr       = null
     con.clear()
+
+    waitMs(300) // TSVM timing fix
 }
 
 // ============================================================================
