@@ -457,6 +457,24 @@ function strobikend() {
 // keeping input polling alive. Returns false if the user quit.
 function bbwait(us) { return runScene(us, 60, function() {}) }
 
+// bbflushwait — bb.c:bbflushwait(). Pushes the textbuffer to the screen then
+// waits `us` µs. Used by scene4's invader animation (purely textbuffer ops,
+// no image-buffer pipeline).
+function bbflushwait(us) {
+    const ctx = aaCtx()
+    aa.flush(ctx)
+    return bbwait(us)
+}
+
+// bbGetwidth — bb.c:getwidth(size). Per-glyph width that centerprint would
+// use for the given size on the current context.
+function bbGetwidth(ctx, size) {
+    const W = aa.imgwidth(ctx), H = aa.imgheight(ctx)
+    const mmW = aa.mmwidth(ctx), mmH = aa.mmheight(ctx)
+    const height = H / size
+    return height * W * 0.75 / H * mmH / mmW
+}
+
 function scene1() {
     const ctx    = aaCtx()
     const params = g_aaPar
@@ -611,7 +629,7 @@ function scene1() {
             "FULL","80-COL","TEXT","MODE","",
             "DEVELOPED","UNDER","TVDOS","!","!","!","?",
         ]
-        const blSize = [3,3.5,3.5,4.2,3,2,2,3,3,3,3,1,5,3,3,1,2,3,4.2]
+        const blSize = [3,3.5,3.5,4.6,3,2,2,3,3,3,3,1,4.4,3,3,1.5,2.2,3,4.2]
         for (let i = 0; i < blText.length; i++) {
             if (g_quit || g_skip) { g_skip = false; return }
             strobikstart()
@@ -678,41 +696,97 @@ function scene1() {
 // ============================================================================
 // SCENE 2 — Greetings scroller + group-name zoomer parade
 // ============================================================================
-function scene2() {
-    clearScreen()
-
-    // Cross-scroll banner: "TO" travels left -> right at the top third;
-    // "GREETINGS" travels right -> left at the bottom third.  Off-centre
-    // positioning via bigText's xCenter argument lets them sweep across.
-    const ok = runScene(2750000, 24, function(el, total) {
-        con.clear()
-        const t = el / total
-        // map t in [0,1] to centre column from -8 to TCOLS+8 (and inverse)
-        const sweepW = TCOLS + 16
-        const xTo  = (-8 + t * sweepW) | 0
-        const xGr  = (TCOLS + 8 - t * sweepW) | 0
-        bigText((TROWS / 3) | 0,       "TO",        2, 0xDB, xTo)
-        bigText(((TROWS * 2) / 3) | 0, "GREETINGS", 1, 0xDB, xGr)
-    })
-    if (!ok) return
-
-    // Parade of group-name pop-ups, each ~0.65 s
-    const GROUPS = [
-        "FUTURE CREW", "TRITON", "CASCADA", "COMPLEX",
-        "PASCAL", "TITANS", "XOGRAPHY", "SONIC PC",
-        "SCRYMAG", "...", "MICROSOFT", "?!?",
-    ]
-    for (let i = 0; i < GROUPS.length; i++) {
-        if (g_quit) return
-        const ok2 = runScene(650000, 30, function(el, dur) {
-            con.clear()
-            const t = el / dur
-            const sc = Math.max(1, Math.round(3 - t * 2))
-            const y = 4 + ((i % 3) * ((TROWS - 8) / 2)) | 0
-            bigText(y, GROUPS[i], sc)
-        })
-        if (!ok2) return
+// ── scene2.c port ───────────────────────────────────────────────────────────
+// Two phases:
+//   1. dvojprujezd2(): "Greetings" slides L→R at H/3, "To" slides R→L at 2H/3.
+//      Runs 2.75 s.
+//   2. pokec parade: each name zooms outward from a tiny point at the centre
+//      (small + bright → large + dark) while the PREVIOUS name continues its
+//      zoom-out from 650 ms ago, producing a crossfade. ETIME=650 ms per name,
+//      3*ETIME for the last.
+// ============================================================================
+function _scene2Drawzoomer(ctx, font, mesg, stateUs, posIdx, imgW, imgH) {
+    if (!mesg || mesg.length === 0) return
+    if (stateUs <= 0) return
+    const width = 1000000.0 / stateUs
+    if (width > 1.0) {
+        let color = ((width - 1) * 255) | 0
+        if (color > 255) color = 255
+        if (color < 0)   color = 0
+        _s1Centerprint(ctx, font, imgW / 2, posIdx * imgH / 6, width, color, mesg)
     }
+}
+
+function scene2() {
+    const ctx = aaCtx(), font = aaFont()
+    const params = g_aaPar
+    const imgW = aa.imgwidth(ctx), imgH = aa.imgheight(ctx)
+
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx); aa.clear(ctx)
+    params.dither    = aa.AA_FLOYD_S
+    params.bright    = 0
+    params.contrast  = 0
+    params.randomval = 0
+    g_drawptr     = null
+    g_overlayText = ""
+
+    // ── Phase 1: dvojprujezd2 ───────────────────────────────────────────────
+    const dur1 = 2750000
+    let phaseStart = sysNow()
+    g_drawptr = function() {
+        const STATE = ((sysNow() - phaseStart) / 1000) | 0
+        const total = dur1
+        aa.clear(ctx)
+        const w = bbGetwidth(ctx, 2)
+        // text1 = "Greetings" slides L→R at H/3
+        const t1 = "Greetings"
+        let p = w * t1.length + 1
+        _s1Centerprint(ctx, font,
+            -p / 2 + (imgW + p * 1.2) * STATE / total,
+            imgH / 3, 2, 255, t1)
+        // text2 = "To" slides R→L at 2H/3
+        const t2 = "To"
+        p = w * t2.length + 1
+        _s1Centerprint(ctx, font,
+            imgW + p / 2 - (imgW + p * 1.2) * STATE / total,
+            2 * imgH / 3, 2, 255, t2)
+    }
+    timestuff(60, null, bbDraw, dur1)
+    if (g_quit) return
+
+    // ── Phase 2: pokec parade ───────────────────────────────────────────────
+    const pokec = [
+        "Future", "Crew", "Triton", "Cascada", "Complex", "Pascal",
+        "Titans", "Xography", "Sonic PC", "Scrymag", "...",
+        "Microsoft", "", "!?!",
+    ]
+    const ETIME = 650000
+    let mesg = "", lastmesg = ""
+    let pos = 2, lastpos = 1
+
+    for (let i = 0; i < pokec.length; i++) {
+        if (g_quit) return
+        lastpos = pos
+        pos++
+        if (pos > 4) pos = 2
+        lastmesg = mesg
+        mesg     = pokec[i]
+        const itemDur = (i === pokec.length - 1) ? 3 * ETIME : ETIME
+        const iterStart = sysNow()
+        const _mesg = mesg, _lastmesg = lastmesg
+        const _pos  = pos,  _lastpos  = lastpos
+        g_drawptr = function() {
+            const STATE = ((sysNow() - iterStart) / 1000) | 0
+            aa.clear(ctx)
+            // Previous name lingers — it was launched ETIME ago.
+            _scene2Drawzoomer(ctx, font, _lastmesg, STATE + ETIME, _lastpos, imgW, imgH)
+            // Current name just started.
+            _scene2Drawzoomer(ctx, font, _mesg,     STATE,         _pos,     imgW, imgH)
+        }
+        timestuff(0, null, bbDraw, itemDur)
+    }
+    g_drawptr = null
 }
 
 // ============================================================================
@@ -845,7 +919,9 @@ function scene3() {
     }
 
     // Initial half-second pause to match `bbwait(500000)`.
-    if (!waitMs(500)) return
+    // which is adjusted for TSVM timing
+    // or put global multiplier to waitMs(), the typewriter is also sluggish
+    if (!waitMs(300)) return
 
     runScene(_PLASMA_DUR_US, _PLASMA_FRAMERATE, function(elapsed, total) {
         // ── do_plasma(step=1) ────────────────────────────────────────────
@@ -915,86 +991,267 @@ function scene3() {
 }
 
 // ============================================================================
-// SCENE 4 — space invaders & fire
+// SCENE 4 — near-verbatim port of scene4.c
+//
+// Five textbuffer phases (invader build-up, swaying march, explosion, drop-
+// down to "\@@/", drop-down to "\--/") followed by an image-buffer fire
+// engine. Each text phase is a series of aa.puts + bbflushwait — the
+// invaders, cannon, and explosion ASCII are byte-identical to scene4.c.
+//
+// Fire engine:
+//   - tableLUT[i] = (i - minus) / 5  if i > minus else 0
+//   - firemain(): each pixel := table[sum of 3 neighbours one row below +
+//                                       2 neighbours two rows below]
+//   - drawfire(n) seeds the row right below the visible area with random
+//     intensity bursts capped by `height` (which ramps up/down based on the
+//     remaining scene time), then runs firemain() to propagate the flame
+//     upward and decays params.bright by 12.
+// The image buffer is reallocated +4 rows tall so firemain can read past the
+// visible bottom without out-of-bounds; we use a swap-in scratch buffer.
 // ============================================================================
 function scene4() {
-    clearScreen()
-    const rowYs = [3, 6, 9]
-    for (let x = 1; x <= TCOLS - 8; x += 6) {
-        if (g_quit) return
-        for (let i = 0; i < rowYs.length; i++) drawText(rowYs[i], x, " ----")
-        if (!waitMs(20)) return
-    }
-    for (let x = 1; x <= TCOLS - 8; x += 6) {
-        if (g_quit) return
-        for (let i = 0; i < rowYs.length; i++) drawText(rowYs[i], x, " -oo-")
-        if (!waitMs(10)) return
-    }
-    let cannonX = HALF_W
+    const ctx = aaCtx(), font = aaFont()
+    const params = g_aaPar
+    const scrW = aa.scrwidth(ctx), scrH = aa.scrheight(ctx)
+    const imgW = aa.imgwidth(ctx), imgH = aa.imgheight(ctx)
 
-    let frame = 0
-    const okMarch = runScene(2200000, 16, function() {
-        const ch = (frame & 1) ? " /OO\\" : " \\oo/"
-        for (let x = 1; x <= TCOLS - 8; x += 6) {
-            for (let i = 0; i < rowYs.length; i++) drawText(rowYs[i], x, ch)
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx)
+    aa.clear(ctx)
+    params.dither    = aa.AA_FLOYD_S
+    params.bright    = 0
+    params.contrast  = 0
+    params.randomval = 0
+    g_drawptr     = null
+    g_overlayText = ""
+
+    const N  = 10
+    const N1 = 20
+
+    let n, wtime, x, y, p, q, d, k, i
+
+    // ── Phase 1: build a row of " ----" invaders one chunk at a time ────────
+    n = ((scrW - 5 - N1 + 5) / 6) | 0
+    wtime = (1.0 * 1000000 / n) | 0
+    for (x = 0; x < scrW - 5 - N1; x += 6) {
+        if (g_quit) return
+        for (y = 0; y < 10; y += 3)
+            aa.puts(ctx, x, y, aa.AA_NORMAL, " ----")
+        if (!bbflushwait(wtime)) return
+    }
+
+    // ── Phase 2: draw the cannon row "/~~\" sliding L→R ─────────────────────
+    n = ((scrW - 7 + 7) / 8) | 0
+    wtime = (1.0 * 1000000 / n) | 0
+    for (x = 0; x < scrW - 7; x += 8) {
+        if (g_quit) return
+        aa.puts(ctx, x, scrH - 3, aa.AA_NORMAL, "/~~\\")
+        if (!bbflushwait(wtime)) return
+    }
+
+    // ── Phase 3: " -oo-" fills in invader rows one stripe at a time ─────────
+    for (y = 0; y < 10; y += 3) {
+        if (g_quit) return
+        for (x = 0; x < scrW - 5 - N1; x += 6)
+            aa.puts(ctx, x, y, aa.AA_NORMAL, " -oo-")
+        if (!bbflushwait(0.1 * 1000000)) return
+    }
+    if (!bbflushwait(0.2 * 1000000)) return
+
+    // ── Phase 4: invader sway + cannon jitter at the bottom ─────────────────
+    // Three outer iterations (q = 0,2,4 entry → q ends at 6), each with two
+    // passes of N1 inner steps. The first pass shifts invaders right; the
+    // second shifts them back. The cannon "[^]" wobbles by rand()%3-1 each
+    // inner step.
+    p = (scrW / 2) | 0
+    d = k = 0
+    const clrinvaz = function() {
+        const limit = Math.min(15, scrH)
+        const tb = ctx.textbuffer, ab = ctx.attrbuffer
+        for (let j = 0; j < scrW * limit; j++) {
+            tb[j] = 0x20
+            ab[j] = aa.AA_NORMAL
         }
-        cannonX += ((Math.random() * 3) | 0) - 1
-        if (cannonX < 4) cannonX = 4
-        if (cannonX > TCOLS - 4) cannonX = TCOLS - 4
-        drawText(TROWS - 1, cannonX - 2, "  [^]  ")
-        frame++
-    })
-    if (!okMarch) return
-
-    // Invaders die — explosion flicker
-    for (let blink = 0; blink < 5; blink++) {
+    }
+    for (q = 0; q < 5; q++) {
         if (g_quit) return
-        for (let x = 1; x <= TCOLS - 8; x += 6)
-            for (let i = 0; i < rowYs.length; i++) drawText(rowYs[i], x, " /**\\")
-        if (!waitMs(120)) return
-        for (let x = 1; x <= TCOLS - 8; x += 6)
-            for (let i = 0; i < rowYs.length; i++) drawText(rowYs[i], x, "     ")
-        if (!waitMs(120)) return
+        clrinvaz()
+        for (i = 0; i < N1; i++) {
+            if (g_quit) return
+            d++; if (d > 8) { k ^= 1; d = 0 }
+            for (x = 0; x < scrW - 5 - N1; x += 6)
+                for (y = 0; y < 10; y += 3)
+                    aa.puts(ctx, x + i, y + q, aa.AA_NORMAL, k ? " \\oo/ " : " /OO\\ ")
+            aa.puts(ctx, p, scrH - 1, aa.AA_NORMAL, " [^] ")
+            p += ((Math.random() * 3) | 0) - 1
+            if (!bbflushwait(0.02 * 1000000)) return
+        }
+        q++
+        clrinvaz()
+        for (i = N1; i > 0; i--) {
+            if (g_quit) return
+            d++; if (d > 8) { k ^= 1; d = 0 }
+            for (x = 0; x < scrW - 5 - N1; x += 6)
+                for (y = 0; y < 10; y += 3)
+                    aa.puts(ctx, x + i, y + q, aa.AA_NORMAL, k ? " \\oo/ " : " /OO\\ ")
+            aa.puts(ctx, p, scrH - 1, aa.AA_NORMAL, " [^] ")
+            p += ((Math.random() * 3) | 0) - 1
+            if (!bbflushwait(0.02 * 1000000)) return
+        }
     }
 
-    // Fire effect
-    const cols = TCOLS
-    const bot = new Array(cols).fill(0)
-    const fld = []
-    for (let y = 0; y < TROWS; y++) {
-        const a = new Array(cols)
-        for (let x = 0; x < cols; x++) a[x] = 0
-        fld.push(a)
+    // ── Phase 5: short final march at column-offset N ──────────────────────
+    clrinvaz()
+    for (i = 0; i < N; i++) {
+        if (g_quit) return
+        d++; if (d > 8) { k ^= 1; d = 0 }
+        for (x = 0; x < scrW - 5 - N1; x += 6)
+            for (y = 0; y < 10; y += 3)
+                aa.puts(ctx, x + i, y + q, aa.AA_NORMAL, k ? " \\oo/ " : " /OO\\ ")
+        aa.puts(ctx, p, scrH - 1, aa.AA_NORMAL, " [^] ")
+        p += ((Math.random() * 3) | 0) - 1
+        if (!bbflushwait(0.01 * 1000000)) return
     }
-    const fireRamp = " .,:^*&%$#@"
-    const okFire = runScene(3500000, 22, function(el, total) {
-        for (let x = 0; x < cols; x++) {
-            bot[x] = Math.max(0, bot[x] + ((Math.random() * 80) | 0) - 30)
-            if (bot[x] > 255) bot[x] = 255
-            fld[TROWS - 1][x] = bot[x]
+
+    // ── Phase 6: explosion blink (/OO\ ↔ /**\, 5 times) ─────────────────────
+    for (i = 0; i < 5; i++) {
+        if (g_quit) return
+        for (x = 0; x < scrW - 5 - N1; x += 6)
+            for (y = 0; y < 10; y += 3)
+                aa.puts(ctx, x + N, y + q, aa.AA_NORMAL, " /OO\\")
+        if (!bbflushwait(0.1 * 1000000)) return
+        for (x = 0; x < scrW - 5 - N1; x += 6)
+            for (y = 0; y < 10; y += 3)
+                aa.puts(ctx, x + N, y + q, aa.AA_NORMAL, " /**\\")
+        if (!bbflushwait(0.1 * 1000000)) return
+    }
+
+    // ── Phase 7: invaders fall as "\@@/" then "\--/", cannon becomes "(~)" ──
+    n = scrH - 10 - q
+    if (((scrH / 2) | 0) < 10) n = ((scrH / 2) | 0) - q
+    if (n < 1) {
+        if (!bbflushwait(0.7 * 1000000)) return
+    } else {
+        wtime = (0.7 * 1000000 / n) | 0
+        i = q
+        for (; i < ((scrH / 2) | 0); i++) {
+            if (g_quit) return
+            for (x = 0; x < scrW - 5 - N1; x += 6)
+                for (y = 0; y < 10; y += 3) {
+                    aa.puts(ctx, x + N, y + i,     aa.AA_NORMAL, "     ")
+                    aa.puts(ctx, x + N, y + i + 1, aa.AA_NORMAL, " \\@@/")
+                }
+            aa.puts(ctx, p - 2, scrH - 1, aa.AA_NORMAL, "   [^]   ")
+            p += ((Math.random() * 5) | 0) - 2
+            if (!bbflushwait(wtime)) return
         }
-        for (let y = 0; y < TROWS - 1; y++) {
-            const dst = fld[y], src = fld[y + 1]
-            for (let x = 0; x < cols; x++) {
-                const lx = (x === 0) ? x : x - 1
-                const rx = (x === cols - 1) ? x : x + 1
-                dst[x] = ((src[lx] + src[x] + src[rx]) / 3.05) | 0
+        for (; i < scrH - 10; i++) {
+            if (g_quit) return
+            for (x = 0; x < scrW - 5 - N1; x += 6)
+                for (y = 0; y < 10; y += 3) {
+                    aa.puts(ctx, x + N, y + i,     aa.AA_NORMAL, "     ")
+                    aa.puts(ctx, x + N, y + i + 1, aa.AA_NORMAL, " \\--/")
+                }
+            aa.puts(ctx, p - 2, scrH - 1, aa.AA_NORMAL, "   (~)   ")
+            p += ((Math.random() * 7) | 0) - 3
+            if (!bbflushwait(wtime)) return
+        }
+    }
+    if (g_quit) return
+
+    // ── Phase 8: backconvert + fire ─────────────────────────────────────────
+    // Swap in a +4-row scratch buffer so firemain() can read p+2*imgW past
+    // the visible bottom without OOB. The bottom seed rows live in this tail.
+    const origBuf = ctx.imagebuffer
+    const fireBuf = new Uint8Array(imgW * (imgH + 4))
+    ctx.imagebuffer = fireBuf
+    aa.backconvert(ctx, 0, 0, scrW, scrH)
+    params.bright = 120
+    bbDraw()
+    if (!bbflushwait(0.1 * 1000000)) { ctx.imagebuffer = origBuf; return }
+    params.bright = 255
+    bbDraw()
+    if (!bbflushwait(0.1 * 1000000)) { ctx.imagebuffer = origBuf; return }
+
+    // Lay a hot horizontal "ember" stripe across the bottom — the fire seed
+    // line — then build the rise-LUT.
+    for (let xi = 20; xi < imgW - 20; xi++) {
+        fireBuf[(imgH - 10) * imgW + xi] = 255
+        fireBuf[(imgH - 11) * imgW + xi] = 255
+        fireBuf[(imgH - 12) * imgW + xi] = 255
+        fireBuf[(imgH - 13) * imgW + xi] = 255
+    }
+    const MAXTABLE = 256 * 5
+    let minus = (800 / imgH) | 0
+    if (minus === 0) minus = 1
+    const table = new Uint16Array(MAXTABLE)
+    for (let ii = 0; ii < MAXTABLE; ii++) {
+        table[ii] = (ii > minus) ? (((ii - minus) / 5) | 0) : 0
+    }
+
+    const firemain = function() {
+        const end = imgW * imgH
+        for (let pp = 0; pp < end; pp++) {
+            const sum = fireBuf[pp + imgW - 1] + fireBuf[pp + imgW + 1] + fireBuf[pp + imgW]
+                      + fireBuf[pp + 2 * imgW - 1] + fireBuf[pp + 2 * imgW + 1]
+            fireBuf[pp] = table[sum] || 0
+        }
+    }
+
+    const fireDurUs    = 7 * 1000000
+    const fireStartUs  = sysNow()
+    let fireHeight = 0
+
+    const drawfire = function(nticks) {
+        for (let t = 0; t < nticks; t++) {
+            const elapsedUs = ((sysNow() - fireStartUs) / 1000) | 0
+            const timeLeftUs = fireDurUs - elapsedUs
+            // Heuristic from C: ramp height down when remaining < current
+            // height (so the flame dies away near the end).
+            if (fireHeight > timeLeftUs - fireHeight) fireHeight -= 6
+            else                                      fireHeight += 6
+            if (fireHeight < 0) fireHeight = 0
+
+            let i1 = 1, i2 = 4 * imgW + 1
+            if (timeLeftUs > 2000000) {
+                // Seed rows imgH .. imgH+2 with random bursts.
+                let pp = imgW * imgH
+                const rowEnd = imgW * (imgH + 1)
+                while (pp < rowEnd) {
+                    const m = Math.min(Math.min(i1, i2), Math.max(1, fireHeight))
+                    let last1 = (Math.random() * m) | 0
+                    let burst = (Math.random() * 6) | 0
+                    while (pp < rowEnd && burst !== 0) {
+                        fireBuf[pp]            = last1 & 0xFF
+                        last1 += ((Math.random() * 6) | 0) - 2
+                        fireBuf[pp + imgW]     = last1 & 0xFF
+                        last1 += ((Math.random() * 6) | 0) - 2
+                        pp++; burst--; i1 += 4; i2 -= 4
+                    }
+                    if (pp + 2 * imgW < fireBuf.length) {
+                        fireBuf[pp + 2 * imgW] = last1 & 0xFF
+                    }
+                    pp++; i1 += 4; i2 -= 4
+                }
+            } else {
+                // Stop seeding — let the fire die down.
+                for (let pp = imgW * imgH; pp < imgW * (imgH + 4); pp++) fireBuf[pp] = 0
             }
+            firemain()
+            params.bright -= 12
+            if (params.bright < 0) params.bright = 0
         }
-        for (let y = 1; y <= TROWS; y++) {
-            const buf = fld[y - 1]
-            let row = ""
-            for (let x = 0; x < cols; x++) {
-                const v = buf[x]
-                let idx = (v * fireRamp.length / 256) | 0
-                if (idx > fireRamp.length - 1) idx = fireRamp.length - 1
-                row += fireRamp.charAt(idx)
-            }
-            vramPutRow(y, 1, row)
-        }
-    })
-    if (!okFire) return
-    con.clear()
+    }
+
+    const mydraw = function() {
+        aa.render(ctx, params)
+        aa.flush(ctx)
+    }
+
+    timestuff(-25, drawfire, mydraw, fireDurUs)
+
+    // Restore the original image buffer so subsequent scenes see a sane size.
+    ctx.imagebuffer = origBuf
 }
 
 // ============================================================================
