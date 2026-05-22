@@ -318,172 +318,361 @@ function waitMs(ms) {
 }
 
 // ============================================================================
-// SCENE 1 — precalculating screen + reveal + BB letters + title flashes
+// SCENE 1 — near-verbatim port of scene1.c
+//
+// Constants mirror the C #defines:
+//   EFECT=2  → ETIME = 2 s per typewriter / scramble phase
+//   EFECT2=6.0 → 6 s of "decrandom" (AA / PRESENTS sharpening)
+//   N_STEP=30, MAXSHIFT=800, MAXRAND=40, MAXEFECT2=3570
+//
+// The original drives every effect through timestuff(rate, control, draw, dur):
+// the control() function fires at `rate` Hz and receives n ticks elapsed since
+// the last call; draw() repaints between ticks. We reproduce that semantics.
 // ============================================================================
-const HEX = "0123456789ABCDEF"
-function hexChar() {
-    if (Math.random() < 0.25) return ' '
-    if (Math.random() < 0.5) return HEX.charAt(((Math.random() * 6) | 0) + 10)
-    return HEX.charAt((Math.random() * 10) | 0)
+const _S1_EFECT     = 2
+const _S1_EFECT2    = 6.0
+const _S1_ETIME     = _S1_EFECT * 1000000     // 2,000,000 µs
+const _S1_ETIME1    = _S1_EFECT * 1000000
+const _S1_MAXSHIFT  = _S1_EFECT * 400         // 800
+const _S1_MAXRAND   = _S1_EFECT * 20          // 40
+const _S1_N_STEP    = 30
+const _S1_MAXEFECT2 = (_S1_N_STEP * _S1_EFECT2 * 20 - _S1_N_STEP) | 0   // 3570
+
+// HEXA — every other call yields a hex digit (A-F or 0-9), one in three a
+// space. The C macro is `(rand()&2 ? 'A'+rand()%6 : '0'+rand()%10)`; we keep
+// the same A-F vs 0-9 split.
+function _s1Hexa() {
+    return (Math.random() < 0.5)
+        ? String.fromCharCode(0x41 + ((Math.random() * 6)  | 0))   // A-F
+        : String.fromCharCode(0x30 + ((Math.random() * 10) | 0))   // 0-9
 }
 
+// timestuff(rate, control, draw, durUs) — fires control(n) at |rate| Hz with
+// n = number of ticks accumulated since the previous call, and draw() at
+// frame pace between firings. Returns false if the user quit, true otherwise.
+function timestuff(rate, control, draw, durUs) {
+    if (g_quit) return false
+    if (control === null) rate = -40
+    const absRate = Math.abs(rate)
+    const intervalUs = Math.max(1, (1000000 / absRate) | 0)
+    const start = sysNow()
+    let nextTickUs = intervalUs
+    if (control !== null) control(1)              // initial kick, matching C
+    while (true) {
+        if (g_quit || g_skip) break
+        const elapsedUs = ((sysNow() - start) / 1000) | 0
+        if (elapsedUs >= durUs) break
+        if (control !== null && elapsedUs >= nextTickUs) {
+            const n = 1 + (((elapsedUs - nextTickUs) / intervalUs) | 0)
+            nextTickUs += n * intervalUs
+            control(n)
+        }
+        if (draw) draw()
+        checkInput()
+        sleepMs(1)
+    }
+    if (draw && !g_quit) draw()
+    g_skip = false
+    return !g_quit
+}
+
+// Image-buffer centerprint — mirror of bb.c:centerprint(x, y, size, color, t, 0)
+//   height = imgH / size
+//   width  = height * imgW * 0.75 / imgH * mmH / mmW
+// In our context mmW == scrW and mmH == scrH, so mmH/mmW == scrH/scrW.
+function _s1Centerprint(ctx, font, x, y, size, color, text) {
+    const W = aa.imgwidth(ctx), H = aa.imgheight(ctx)
+    const mmW = aa.mmwidth(ctx), mmH = aa.mmheight(ctx)
+    const height = H / size
+    const width  = height * W * 0.75 / H * mmH / mmW
+    if (width < 1 || height < 1) return
+    const w0 = Math.max(1, width  | 0)
+    const h0 = Math.max(1, height | 0)
+    aa.print(ctx,
+        (x - (w0 * text.length) / 2) | 0,
+        (y - (h0 >>> 1)) | 0,
+        w0, h0, font, color | 0, text)
+}
+
+// Same for centerprinth — width is the divisor:
+//   width  = imgW / size
+//   height = width * imgH * 1.333 / imgW * mmW / mmH
+function _s1Centerprinth(ctx, font, x, y, size, color, text) {
+    const W = aa.imgwidth(ctx), H = aa.imgheight(ctx)
+    const mmW = aa.mmwidth(ctx), mmH = aa.mmheight(ctx)
+    const width  = W / size
+    const height = width * H * 1.333 / W * mmW / mmH
+    if (width < 1 || height < 1) return
+    const w0 = Math.max(1, width  | 0)
+    const h0 = Math.max(1, height | 0)
+    aa.print(ctx,
+        (x - (w0 * text.length) / 2) | 0,
+        (y - (h0 >>> 1)) | 0,
+        w0, h0, font, color | 0, text)
+}
+
+// ── Module-level draw / strobik (mirror of bb.c:draw, scene1.c:strobik*) ────
+// `bbDraw` is the global draw(): calls the current drawptr (if any), renders
+// the image buffer into the text buffer (via aa.render), overlays the current
+// status text in AA_SPECIAL, then flushes. Used by every effect that wants
+// the standard pipeline.
+let g_drawptr     = null
+let g_overlayText = ""
+
+function bbOverlay() {
+    if (!g_overlayText || !g_overlayText.length) return
+    const ctx = aaCtx()
+    const scrW = aa.scrwidth(ctx), scrH = aa.scrheight(ctx)
+    const x = ((scrW - g_overlayText.length) / 2) | 0
+    aa.puts(ctx, x, (scrH / 2) | 0, aa.AA_SPECIAL, g_overlayText)
+}
+
+function bbDraw() {
+    const ctx = aaCtx()
+    if (g_drawptr !== null) g_drawptr()
+    aa.render(ctx, g_aaPar)
+    bbOverlay()
+    aa.flush(ctx)
+}
+
+// strobikstart / strobikend — the white-flash + fade primitives. Each portrait
+// transition, every blazinec card, and the scene1 → scene3 handoff all pivot
+// on these.
+function strobikstart() {
+    const params = g_aaPar
+    params.bright = 0
+    timestuff(-60, function(n) { params.bright += n * 50 }, bbDraw, (1000000 / 15) | 0)
+    params.bright = 255
+    bbDraw()
+}
+
+function strobikend() {
+    const params = g_aaPar
+    timestuff(-60, function(n) { params.bright = params.bright >> n }, bbDraw, (1000000 / 3.5) | 0)
+    params.bright = 0
+    bbDraw()
+}
+
+// bbwait — equivalent of bb.c:bbwait(): block for `us` microseconds while
+// keeping input polling alive. Returns false if the user quit.
+function bbwait(us) { return runScene(us, 60, function() {}) }
+
 function scene1() {
-    clearScreen(); con.curs_set(0)
-
-    // Phase 1: hex-cursor "typewriter" — speed ramps up across phases
-    const PHASES = [
-        { rate: 12,  dur: 800000 },
-        { rate: 40,  dur: 700000 },
-        { rate: 90,  dur: 700000 },
-        { rate: 240, dur: 700000 },
-        { rate: 540, dur: 500000 },
-    ]
-    let cx = 0, cy = 0
-    const advance = function() {
-        cx++
-        if (cx >= TCOLS) { cx = 0; cy++; if (cy >= TROWS) cy = 0 }
-    }
-    for (let p = 0; p < PHASES.length; p++) {
-        const ph = PHASES[p]
-        const perTick = Math.max(1, (ph.rate / 30) | 0)
-        const ok = runScene(ph.dur, 30, function() {
-            for (let i = 0; i < perTick; i++) {
-                advance()
-                putCh(cy + 1, cx + 1, hexChar().charCodeAt(0))
-            }
-            // Hint text stays pinned mid-screen.
-            centerText((TROWS >>> 1) + 1, "Please wait. Precalculating data")
-        })
-        if (!ok) return
-    }
-
-    // Phase 2: scramble each line entirely, growing intensity by stage
-    let randChars = 0, randAttrs = 0
-    const stages = [
-        { chars: 0,  attrs: 0  },
-        { chars: 1,  attrs: 0  },
-        { chars: 25, attrs: 0  },
-        { chars: 25, attrs: 1  },
-        { chars: 25, attrs: 25 },
-    ]
-    for (let s = 0; s < stages.length; s++) {
-        randChars = stages[s].chars
-        randAttrs = stages[s].attrs
-        const ok = runScene(550000, 30, function() {
-            for (let y = 1; y <= TROWS; y++) {
-                if (Math.random() < 0.25) continue
-                const shift = (Math.random() * TCOLS) | 0
-                let row = ""
-                for (let x = 1; x <= TCOLS; x++) {
-                    if (randChars && Math.random() * 50 < randChars) row += " "
-                    else row += ((x - shift) % 3) ? hexChar() : ' '
-                }
-                if (randAttrs && Math.random() * 50 < randAttrs) setFG(GREY)
-                else setFG(WHITE)
-                vramPutRow(y, 1, row)
-            }
-            setFG(WHITE)
-            centerText((TROWS >>> 1) + 1, "Please wait. Precalculating data")
-        })
-        if (!ok) return
-    }
-
-    // ── Phases 3-5: switch to the AAlib pipeline for proper big-text ASCII art ──
     const ctx    = aaCtx()
     const params = g_aaPar
     const font   = aaFont()
-    const W = aa.imgwidth(ctx)
-    const H = aa.imgheight(ctx)
-    const buf = ctx.imagebuffer
+    const scrW = aa.scrwidth(ctx), scrH = aa.scrheight(ctx)
+    const imgW = aa.imgwidth(ctx),  imgH = aa.imgheight(ctx)
+    const tb = ctx.textbuffer, ab = ctx.attrbuffer
+
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx)
+    aa.clear(ctx)
+    aa.flush(ctx)
+
     params.dither    = aa.AA_FLOYD_S
     params.bright    = 0
     params.contrast  = 0
     params.randomval = 0
 
-    // Helper: centre a glyph row inside the image buffer.
-    // `text`  : the string to render
-    // `gw,gh` : per-glyph pixel size (post-scaling)
-    // `cy`    : centre row in image-pixel space
-    // `xCenter`: optional centre column override (image-pixel space)
-    function aaCenter(text, gw, gh, cy, color, xCenter) {
-        const totalW = text.length * gw
-        const cxc = (xCenter === undefined) ? (W >>> 1) : xCenter
-        const x0  = cxc - (totalW >>> 1)
-        aa.print(ctx, x0, cy - (gh >>> 1), gw, gh, font, color, text)
+    g_overlayText = "Please wait. Precalculating data"
+    g_drawptr     = null
+    let cursorx = 0, cursory = 0
+    let s1_bright = 255
+    let s1_pos = 0, s1_delta = 0, s1_dist = 0
+    let s1_f = -10.0
+    let randshift = 0, randcharacters = 0, randattrs = 0
+
+    // ── drawwait: just flush current textbuffer with overlay ────────────────
+    const drawwait = function() {
+        bbOverlay()
+        aa.flush(ctx)
     }
 
-    // Seed the image buffer with high-res noise so the dissolve has something
-    // to chew through. (Phase 2 left the screen full of cell-mode hex chars;
-    // we approximate that as random luminance.)
-    for (let i = 0; i < buf.length; i++) buf[i] = (Math.random() * 220) | 0
-
-    // Phase 3 — dissolve, reveal "AA / PRESENTS"
-    // TSVM font glyphs are 7x14; we pick scales that keep the rendered text
-    // safely inside the image buffer (H is small, easy to clip).
-    const aaW = 7 * 4, aaH = 14 * 2          // big "AA" — 4x wide, 2x tall
-    const prW = 7 * 2, prH = 14              // smaller "PRESENTS" — 2x wide, native
-    const ok3 = runScene(1500000, 30, function(el, total) {
-        // Eat away random pixels each tick.
-        const nKill = (buf.length * 0.06) | 0
-        for (let n = 0; n < nKill; n++) {
-            const idx = (Math.random() * buf.length) | 0
-            buf[idx] = 0
+    // ── calculateslow: write one cell per call (the "slow typewriter") ─────
+    const calculateslow = function(n) {
+        cursorx++
+        if (cursorx >= scrW) {
+            cursory++
+            cursorx = 1
+            if (cursory >= scrH) cursory = 0
         }
-        aaCenter("AA",       aaW, aaH, (H / 3) | 0,         255)
-        aaCenter("PRESENTS", prW, prH, ((H * 2) / 3) | 0,   200)
-        aa.render(ctx, params)
-        aa.flush(ctx)
-    })
-    if (!ok3) return
-    if (!waitMs(400)) return
-
-    // Phase 4 — two B letters drop in with a damped harmonic and converge on
-    // the central row, mirrored horizontally. Animates in image-pixel space.
-    let pos  = H * 2
-    let v    = -10.0 * 2          // scaled to image space (2x denser than rows)
-    let bScale = 3                // shrinks as the harmonic settles
-    const xL = W >>> 2            // ~quarter column in image space
-    const xR = W - (W >>> 2)
-    const ok4 = runScene(1900000, 30, function() {
-        v += ((H / 2 - pos) / 60.0)
-        v *= 0.95
-        pos += v
-        if (bScale > 1 && Math.random() < 0.03) bScale--
-        aa.clear(ctx)
-        const py = Math.max(0, Math.min(H - 1, pos | 0))
-        // Native font aspect (7:14). bScale 3 → 21x42 fits inside H=60.
-        const gw = 7 * bScale, gh = 14 * bScale
-        aa.print(ctx, xL - (gw >>> 1), py - (gh >>> 1), gw, gh, font, 255, "B")
-        aa.print(ctx, xR - (gw >>> 1), H - py - (gh >>> 1), gw, gh, font, 255, "B")
-        aa.render(ctx, params)
-        aa.flush(ctx)
-    })
-    if (!ok4) return
-
-    // Phase 5 — rapid title flashes
-    const flashes = [
-        ["THE",       2],  ["100%",     2],
-        ["ANSI C",    2],  ["PORTABLE", 2],
-        ["DEMO",      2],  [";-D",      2],
-        ["(-;",       2],  ["FULL",     2],
-        ["80 COL",    2],  ["TEXT",     2],
-        ["MODE",      2],  ["DEVELOPED",1],
-        ["UNDER",     2],  ["TSVM",     3],
-        ["!!!",       3],  ["?",        3],
-    ]
-    for (let i = 0; i < flashes.length; i++) {
-        if (g_quit) return
-        const sc = flashes[i][1]
-        aa.clear(ctx)
-        aaCenter(flashes[i][0], 7 * sc, 14 * sc, H >>> 1, 255)
-        aa.render(ctx, params)
-        aa.flush(ctx)
-        if (!waitMs(130 + ((Math.random() * 60) | 0))) return
-        aa.clear(ctx)
-        aa.render(ctx, params)
-        aa.flush(ctx)
-        if (!waitMs(50)) return
+        const ch = ((cursorx % 3) !== 0) ? _s1Hexa().charCodeAt(0) : 0x20
+        tb[cursory * scrW + cursorx - 1] = ch
+        ab[cursory * scrW + cursorx - 1] = aa.AA_NORMAL
     }
+
+    // ── drawline: full-row scramble used by calculatefast / drawwait3 ──────
+    const drawline = function(y) {
+        const useShift = (Math.random() * _S1_MAXSHIFT) < randshift
+        const shift = useShift ? ((Math.random() * 1048576) | 0) : -1
+        const base = y * scrW
+        for (let x = 0; x < scrW; x++) {
+            if (randattrs && (Math.random() * _S1_MAXRAND) < randattrs) {
+                // leave attr alone
+            } else {
+                ab[base + x] = aa.AA_NORMAL
+            }
+            if (randcharacters && (Math.random() * _S1_MAXRAND) < randcharacters) {
+                // leave char alone
+                continue
+            }
+            tb[base + x] = (((x - shift) % 3) !== 0) ? _s1Hexa().charCodeAt(0) : 0x20
+        }
+    }
+
+    // ── calculatefast: scramble n whole lines per call ─────────────────────
+    const calculatefast = function(n) {
+        if (randshift) randshift += n
+        for (let i = 0; i < n; i++) {
+            drawline(cursory)
+            cursory++
+            cursorx = 0
+            if (cursory >= scrH) cursory = 0
+        }
+    }
+
+    // ── drawwait3: render the (empty) image buffer then scramble all rows ──
+    const drawwait3 = function() {
+        aa.render(ctx, params)
+        for (let y = 0; y < scrH; y++) drawline(y)
+        bbOverlay()
+        aa.flush(ctx)
+    }
+
+    // ── calculatefastest: just ramp randcharacters / randattrs in place ────
+    const calculatefastest = function(n) {
+        if (randcharacters) randcharacters += n
+        if (randattrs)      randattrs      += n
+    }
+
+    // ── decrandom: decrease params.randomval (sharpens the AA/PRESENTS) ────
+    const decrandom = function(n) {
+        if (params.randomval > 0) params.randomval -= n * _S1_N_STEP
+        if (params.randomval < 60) params.randomval = 60
+    }
+
+    // ── decbright: decrease the local `bright` (fades the AA/PRESENTS) ─────
+    const decbright = function(n) { s1_bright -= n * 16 }
+
+    // ── makepos / makepos1 / makepos2: damped harmonic for the two B's ─────
+    const makepos = function(n) {
+        for (let i = 0; i < n; i++) {
+            s1_f += (imgH / 2 - s1_pos) / 60.0
+            s1_f *= 0.95
+            s1_pos += s1_f
+        }
+    }
+    const makepos1 = function(n) {
+        for (let i = 0; i < n; i++) {
+            s1_f += (imgH / 2 - s1_pos) / 60.0
+            s1_f *= 0.95
+            s1_pos += s1_f
+            s1_delta += 0.2
+        }
+    }
+    const makepos2 = function(n) {
+        for (let i = 0; i < n; i++) {
+            s1_f += (imgH / 2 - s1_pos) / 60.0
+            s1_f *= 0.95
+            s1_pos += s1_f
+            s1_delta -= 0.2
+            if (s1_delta <= 2) s1_delta = 0.1
+            s1_dist += 0.08
+        }
+    }
+
+    // ── drawwait2: AA + PRESENTS (image-buffer ink, faded via `bright`) ────
+    const drawwait2 = function() {
+        let i = s1_bright
+        if (i < 0) i = 0
+        _s1Centerprint(ctx, font, imgW / 2, imgH / 3, 2, i, "AA")
+        i = s1_bright + 255
+        if (i < 0) i = 0
+        if (i > 255) i = 255
+        _s1Centerprinth(ctx, font, imgW / 2, 2 * imgH / 3, 8, i, "PRESENTS")
+    }
+
+    // ── drawwait4: two mirrored B's drifting on a damped harmonic ──────────
+    const drawwait4 = function() {
+        aa.clear(ctx)
+        const size = 1.1 + s1_delta / 2
+        _s1Centerprint(ctx, font, imgW / 4 - s1_dist * imgW,        s1_pos,         size, 255, "B")
+        _s1Centerprint(ctx, font, 3 * imgW / 4 + s1_dist * imgW,    imgH - s1_pos,  size, 255, "B")
+    }
+
+    const hlaska = function(t, sz) {
+        aa.clear(ctx)
+        _s1Centerprint(ctx, font, imgW / 2, imgH / 2, sz, 255, t)
+    }
+    const blazinec = function() {
+        const blText = [
+            "the","100 %","TSVM","COMPATIBLE","DEMO",";^D","(^;",
+            "FULL","80-COL","TEXT","MODE","",
+            "DEVELOPED","UNDER","TVDOS","!","!","!","?",
+        ]
+        const blSize = [3,3.5,3.5,4.2,3,2,2,3,3,3,3,1,5,3,3,1,2,3,4.2]
+        for (let i = 0; i < blText.length; i++) {
+            if (g_quit || g_skip) { g_skip = false; return }
+            strobikstart()
+            params.randomval = 0
+            hlaska(blText[i], blSize[i] / 1.5) // arbitrary resizing
+            strobikend()
+        }
+        strobikstart()
+        bbDraw()
+    }
+
+    // ── Opening typewriter ramp — 7 phases × ETIME (2 s each) = 14 s ───────
+    timestuff(-10,  calculateslow, drawwait, _S1_ETIME1)
+    timestuff(-40,  calculateslow, drawwait, _S1_ETIME1)
+    timestuff(-80,  calculateslow, drawwait, _S1_ETIME1)
+    timestuff(-30,  calculatefast, drawwait, _S1_ETIME1)
+    timestuff(-200, calculatefast, drawwait, _S1_ETIME1)
+    timestuff(-420, calculatefast, drawwait, _S1_ETIME)
+    if (g_quit) return
+
+    randshift = 1
+    timestuff(600, calculatefast, drawwait, _S1_ETIME1)
+    randshift = _S1_MAXSHIFT
+    params.randomval = _S1_MAXEFECT2 + 50
+    g_overlayText = ""
+    aa.gotoxy(ctx, 0, 0)
+    aa.hidecursor(ctx)
+    if (g_quit) return
+
+    // ── Full-screen scramble — 5 phases × ETIME (2 s each) = 10 s ──────────
+    timestuff(20, calculatefastest, drawwait3, _S1_ETIME)
+    timestuff(20, calculatefastest, drawwait3, _S1_ETIME)
+    randcharacters = 1
+    timestuff(20, calculatefastest, drawwait3, _S1_ETIME)
+    randcharacters = _S1_MAXRAND
+    randattrs = 1
+    timestuff(20, calculatefastest, drawwait3, _S1_ETIME)
+    randattrs = _S1_MAXRAND
+    timestuff(20, calculatefastest, drawwait3, _S1_ETIME)
+    if (g_quit) return
+
+    // ── play(): music fires HERE, exactly as in scene1.c:377 ───────────────
+    g_drawptr = drawwait2
+    startMusic()
+
+    // ── AA / PRESENTS — randomval drops, then bright fades ─────────────────
+    timestuff(20, decrandom, bbDraw, (_S1_EFECT2 * 1000000) | 0)   // 6 s
+    timestuff(20, decbright, bbDraw, _S1_ETIME)                    // 2 s
+    if (g_quit) return
+
+    // ── Two falling B's, harmonic settles, then they part and exit ─────────
+    s1_pos = imgH * 2
+    g_drawptr = drawwait4
+    timestuff(60, makepos,  bbDraw, 5   * 1000000)
+    timestuff(60, makepos1, bbDraw, 0.2 * 1000000)
+    timestuff(60, makepos2, bbDraw, 0.3 * 1000000)
+    g_drawptr = null
+    if (g_quit) return
+
+    // ── Final strobe parade ────────────────────────────────────────────────
+    blazinec()
 }
 
 // ============================================================================
@@ -582,12 +771,15 @@ function initPlasmaTables() {
 }
 
 function scene3() {
-    clearScreen()
+    // Do NOT clear VRAM here: scene1's final strobikstart() leaves the
+    // textbuffer in a white-out state (params.bright=255 saturates every
+    // cell). Preserving that fill — and letting the plasma loop's per-tick
+    // `bright -= 2` decay it — reproduces scene1.c → scene3.c's white-fade
+    // transition near-verbatim.
     const ctx    = aaCtx()
     const params = g_aaPar
     const font   = aaFont()
     params.dither    = aa.AA_FLOYD_S
-    params.bright    = 0
     params.contrast  = 0
     params.randomval = 0
 
@@ -618,7 +810,9 @@ function scene3() {
     let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0
     let pnum = 0, dir = 1
     let m = 0, n = 0, f = 0
-    let bright = 0
+    // Inherit whatever bright value scene1 left behind (255 after the final
+    // strobikstart()); do_plasma decays it back to 0 — that's the fade-in.
+    let bright = params.bright | 0
 
     // centerprint(x, y, size, color, text) — drives aa.print using the
     // same "size is a divisor of image height" convention as the C code,
@@ -999,7 +1193,14 @@ function scene910() {
 }
 
 // ============================================================================
-// Portraits & messager
+// Portraits, vezen, messager, devezen — near-verbatim ports of scene1.c:vezen,
+// messager.c:messager, and messager.c:devezen1..4.
+//
+// Portrait images: the original loads BW image files and dispimg()'s them into
+// the image buffer. We keep our pre-rendered ASCII portrait .txt files: each
+// is written straight into the aalib textbuffer, and a backconvert() pass
+// projects the cell-mode portrait back into the image buffer so the image-
+// domain strobik fade + devezen wipes operate on it the same way as in C.
 // ============================================================================
 function loadPortrait(path) {
     let fh
@@ -1015,81 +1216,269 @@ function loadPortrait(path) {
     return { cols: cols, rows: rows, lines: lines.slice(1, 1 + rows) }
 }
 
-function showPortrait(p) {
-    clearScreen()
-    if (!p) {
-        bigText(HALF_H, "[?]", 2)
-        return
-    }
-    const x0 = ((TCOLS - p.cols) / 2 | 0) + 1
-    const y0 = ((TROWS - p.rows) / 2 | 0) + 1
+// Write a portrait into the aalib text+attr buffer (centred), then mirror it
+// into the image buffer via backconvert so the strobik fade has something to
+// render. After this, aa.render(image→text) reproduces the portrait — that's
+// what bbDraw drives during strobikend.
+function loadPortraitToBuffer(p) {
+    const ctx = aaCtx()
+    aa.cleartext(ctx)
+    aa.clear(ctx)
+    if (!p) return
+    const scrW = aa.scrwidth(ctx), scrH = aa.scrheight(ctx)
+    const x0 = ((scrW - p.cols) / 2) | 0
+    const y0 = ((scrH - p.rows) / 2) | 0
     for (let i = 0; i < p.rows; i++) {
         const row = p.lines[i] || ""
-        drawText(y0 + i, x0 < 1 ? 1 : x0, row)
+        const yy = y0 + i
+        if (yy < 0 || yy >= scrH) continue
+        aa.puts(ctx, x0 < 0 ? 0 : x0, yy, aa.AA_NORMAL, row)
     }
+    aa.backconvert(ctx, 0, 0, scrW, scrH)
 }
 
-function strobik() {
-    for (let i = 0; i < 3; i++) {
-        if (g_quit) return
-        setBG(WHITE); setFG(BLACK); con.clear(); waitMs(40)
-        setBG(BLACK); setFG(WHITE); con.clear(); waitMs(20)
-    }
-}
-
+// vezen(set) — exact mirror of scene1.c:vezen(): for each of 4 portraits, a
+// strobikstart() flashes white, the next portrait is loaded, strobikend()
+// fades back; bbwait(500ms) between, bbwait(1000ms) after the last.
 function vezen(set) {
+    g_drawptr     = null
+    g_overlayText = ""
     for (let i = 1; i <= 4; i++) {
         if (g_quit) return
-        strobik()
-        const p = loadPortrait(BB_DIR + set + i + ".txt")
-        showPortrait(p)
-        if (!waitMs(1400)) return
+        strobikstart()
+        const p = loadPortraitToBuffer(loadPortrait(BB_DIR + set + i + ".txt"))
+        strobikend()
+        if (i < 4) {
+            if (!bbwait(500000)) return
+        } else {
+            if (!bbwait(1000000)) return
+        }
     }
 }
 
-function messager(bio) {
-    setFG(WHITE); setBG(BLACK)
+// ── messager(c) — near-verbatim port of messager.c:messager() ──────────────
+// `start` tracks the top of the messager region. Each newline() shrinks it
+// until it hits 0, after which the textbuffer scrolls up one row per newline.
+// The result: the bio crawls up from the bottom row, pushing the previous
+// content (the vezen portrait) off the top. A reverse-video cursor sits at
+// the next write position. `bbflushwait(30ms)` per char ≈ ~33 char/s.
+let g_messagerStart = 0
+function messager(c) {
+    const ctx = aaCtx()
+    const scrW = aa.scrwidth(ctx), scrH = aa.scrheight(ctx)
+    const tb = ctx.textbuffer, ab = ctx.attrbuffer
+    const s = c.length
 
-    // Reserve the bottom 11 rows for the typewriter; clear them first.
-    const FLOOR = 11
-    const yTop = TROWS - FLOOR + 1
-    const blank = " ".repeat(TCOLS)
-    for (let y = yTop; y <= TROWS; y++) vramPutRow(y, 1, blank)
+    g_drawptr     = null
+    g_overlayText = ""
 
-    let cy = yTop, cx = 1
+    let start = scrH - 1
+    let cursor_x = 0
+    let cursor_y = scrH - 1
+    g_messagerStart = start
+
     const newline = function() {
-        cy++; cx = 1
-        if (cy > TROWS) {
-            // bottom of our window — blank and stay there
-            vramPutRow(TROWS, 1, blank)
-            cy = TROWS; cx = 1
+        while (cursor_x < scrW) {
+            tb[cursor_x + cursor_y * scrW] = 0x20
+            ab[cursor_x + cursor_y * scrW] = aa.AA_NORMAL
+            cursor_x++
+        }
+        start--
+        if (start < 0) start = 0
+        g_messagerStart = start
+        cursor_y++
+        cursor_x = 0
+        if (cursor_y >= scrH) {
+            // Scroll: rows [start+1 .. scrH-1] move up to [start .. scrH-2],
+            // and the now-empty bottom row is blanked.
+            const rowLen = scrW
+            const off    = start * rowLen
+            const tail   = scrW * (scrH - start - 1)
+            tb.copyWithin(off, off + rowLen, off + rowLen + tail)
+            ab.copyWithin(off, off + rowLen, off + rowLen + tail)
+            for (let x = 0; x < scrW; x++) {
+                tb[(scrH - 1) * scrW + x] = 0x20
+                ab[(scrH - 1) * scrW + x] = aa.AA_NORMAL
+            }
+            cursor_y--
         }
     }
 
-    for (let i = 0; i < bio.length; i++) {
+    const put = function(ch) {
+        if (ch === 0x0A) { newline(); return }
+        tb[cursor_x + cursor_y * scrW] = ch
+        ab[cursor_x + cursor_y * scrW] = aa.AA_NORMAL
+        cursor_x++
+        if (cursor_x === scrW) newline()
+    }
+
+    const putcursor = function() {
+        // AA_REVERSE block at the next write position.
+        if (cursor_x >= 0 && cursor_x < scrW && cursor_y >= 0 && cursor_y < scrH) {
+            ab[cursor_x + cursor_y * scrW] = aa.AA_REVERSE
+            tb[cursor_x + cursor_y * scrW] = 0x20
+        }
+    }
+
+    // bbflushwait — like bbwait but flushes the textbuffer first.
+    const bbflushwait = function(us) {
+        aa.flush(ctx)
+        return bbwait(us)
+    }
+
+    for (let i = 0; i < s; i++) {
         if (g_quit) return
         if (g_skip) { g_skip = false; break }
-        const ch = bio.charAt(i)
-        if (ch === '\n') { newline(); continue }
-        if (cx > TCOLS) newline()
-        putCh(cy, cx, ch.charCodeAt(0))
-        cx++
+        put(c.charCodeAt(i))
+        // The reverse-video cursor is overwritten naturally by the next put().
+        putcursor()
+        if (!bbflushwait(0.03 * 1000000)) return
         if ((i & 7) === 0) checkInput()
-        sleepMs(18)
     }
-    waitMs(800)
+    aa.flush(ctx)
+    bbwait(1000000)
+    aa.gotoxy(ctx, 0, 0)
 }
 
-function devezen() {
-    runScene(700000, 30, function(el, total) {
-        const t = el / total
-        for (let n = 0; n < (t * 180) | 0; n++) {
-            const px = 1 + ((Math.random() * TCOLS) | 0)
-            const py = 1 + ((Math.random() * TROWS) | 0)
-            putCh(py, px, 0x20)
+// ── devezen1..4 — fade-out transitions out of the messager screen ─────────
+// All four start by backconvert()-ing the current text screen into the image
+// buffer (`tographics`) so the per-pixel fade effects have something to work
+// on. They differ only in WHICH timestuff control(s) they run.
+function tographics() {
+    const ctx = aaCtx()
+    const scrW = aa.scrwidth(ctx)
+    const scrH = aa.scrheight(ctx)
+    aa.backconvert(ctx, 0, g_messagerStart, scrW, scrH)
+}
+
+// Snapshot a copy of the current image buffer (used by devezen1's two-buffer
+// scroll wipe).
+function _imgSnapshot() {
+    const ctx = aaCtx()
+    return ctx.imagebuffer.slice()
+}
+
+function devezen1() {
+    // Pixel-domain scroll wipe between TWO snapshots of the image buffer:
+    //   bckup  — pre-tographics image buffer (whatever the previous scene
+    //            left behind; in main() flow that's the post-messager state
+    //            *before* backconvert, ie. the last vezen frame's pixels).
+    //   bckup1 — post-tographics image buffer (the messager text rendered
+    //            back to pixels).
+    // toblack1() ramps a moving Y boundary across the screen, with two
+    // intensity multipliers that blend between bckup and bckup1 above the
+    // line and below it. The result reads as the bio sliding away.
+    const ctx = aaCtx()
+    const params = g_aaPar
+    const W = aa.imgwidth(ctx), H = aa.imgheight(ctx)
+    const bckup  = _imgSnapshot()
+    tographics()
+    const bckup1 = _imgSnapshot()
+    const buf    = ctx.imagebuffer
+    const start  = sysNow()
+    const durUs  = 5000000
+    g_drawptr = null
+    g_overlayText = ""
+
+    const toblack1 = function() {
+        const elapsed = ((sysNow() - start) / 1000) | 0
+        const stage   = elapsed
+        const total   = durUs
+        const pos = (stage * (H + H) / total - H) | 0
+        let minpos = 0
+        for (let y = 0; y < H; y++) {
+            let mul1 = y - pos
+            if (mul1 < 0) mul1 = 0
+            else mul1 = (mul1 * 256 * 4 / H) | 0
+            if (mul1 > 256) mul1 = 256
+
+            let mul2 = y - pos - H
+            if (mul2 < 0) mul2 = 0
+            else mul2 = (mul2 * 256 * 8 / H) | 0
+            if (mul2 > 256) mul2 = 256
+
+            if (mul2 === 0) minpos = y
+            const blend = mul1 - mul2
+            const base = y * W
+            for (let x = 0; x < W; x++) {
+                const v = (blend * bckup[base + x] + mul2 * bckup1[base + x]) >> 8
+                buf[base + x] = v < 0 ? 0 : (v > 255 ? 255 : v)
+            }
         }
-    })
-    con.clear()
+        let renderH = pos + ((3 * H) >> 2)
+        if (renderH < 0) renderH = 0
+        if (renderH > H) renderH = H
+        // aa.render only takes screen-cell rects, not pixel rects; map back.
+        aa.render(ctx, params, 0, 0, aa.scrwidth(ctx), Math.min(aa.scrheight(ctx), (renderH >> 1)))
+        aa.flush(ctx)
+    }
+
+    g_drawptr = toblack1
+    timestuff(0, null, toblack1, durUs)
+    g_drawptr = null
+}
+
+function devezen2() {
+    // Fade to black: params.bright decays from 0 → -256 over 1 s.
+    tographics()
+    const params = g_aaPar
+    const start = sysNow()
+    const durUs = 1000000
+    g_overlayText = ""
+    g_drawptr = function() {
+        const stage = ((sysNow() - start) / 1000) | 0
+        params.bright = -stage * 256 / durUs
+    }
+    timestuff(0, null, bbDraw, durUs)
+    g_drawptr = null
+    params.bright = 0
+}
+
+function devezen3() {
+    // Crank up randomval to 100 over 1 s, then fade to black over another 1 s.
+    tographics()
+    const params = g_aaPar
+    let start = sysNow()
+    const durUs = 1000000
+    g_overlayText = ""
+    g_drawptr = function() {
+        const stage = ((sysNow() - start) / 1000) | 0
+        params.randomval = (stage * 100 / durUs) | 0
+    }
+    timestuff(0, null, bbDraw, durUs)
+    params.randomval = 100
+    start = sysNow()
+    g_drawptr = function() {
+        const stage = ((sysNow() - start) / 1000) | 0
+        params.bright = -stage * 256 / durUs
+    }
+    timestuff(0, null, bbDraw, durUs)
+    params.randomval = 0
+    params.bright = 0
+    g_drawptr = null
+}
+
+function devezen4() {
+    // Drop contrast for 0.5 s, then ramp bright to +256 (white-out) for 0.5 s.
+    tographics()
+    const params = g_aaPar
+    let start = sysNow()
+    const durUs = 500000
+    g_overlayText = ""
+    g_drawptr = function() {
+        const stage = ((sysNow() - start) / 1000) | 0
+        params.contrast = -stage * 256 / durUs
+    }
+    timestuff(0, null, bbDraw, durUs)
+    start = sysNow()
+    g_drawptr = function() {
+        const stage = ((sysNow() - start) / 1000) | 0
+        params.bright = stage * 256 / durUs
+    }
+    timestuff(0, null, bbDraw, durUs)
+    params.bright = 0
+    params.contrast = 0
+    g_drawptr = null
 }
 
 const BIO_FK = (
@@ -1271,7 +1660,7 @@ function closingLogo() {
 function teardown() {
     stopMusic()
     reset()
-    con.color_pair(WHITE, BLACK)
+    con.reset_graphics()
     con.clear()
     con.curs_set(1)
     con.move(1, 1)
@@ -1282,28 +1671,31 @@ function main() {
     clearScreen()
     g_t0_ns = sysNow()
 
-    loadSong(BB_DIR + "bb.taud"); startMusic()
+    // Pre-load the song; playback is kicked off mid-scene1, exactly where the
+    // C scene1.c calls play() (between the scramble phases and "AA PRESENTS").
+    loadSong(BB_DIR + "bb.taud")
 
+    // Scene order + devezen variant per bio match bb.c's bb() loop.
     scene1();           if (g_quit) return
     scene3();           if (g_quit) return
     vezen("fk");        if (g_quit) return
     messager(BIO_FK);   if (g_quit) return
-    devezen()
+    devezen2()          // fade to black
     scene4();           if (g_quit) return
     scene2();           if (g_quit) return
     vezen("ms");        if (g_quit) return
     messager(BIO_MS);   if (g_quit) return
-    devezen()
+    devezen3()          // noise-up then fade to black
     scene8();           if (g_quit) return
     vezen("kt");        if (g_quit) return
     messager(BIO_KT);   if (g_quit) return
-    devezen()
+    devezen1()          // two-buffer scroll wipe
     scene7();           if (g_quit) return
     scene5();           if (g_quit) return
     scene910();         if (g_quit) return
     vezen("hh");        if (g_quit) return
     messager(BIO_HH);   if (g_quit) return
-    devezen()
+    devezen4()          // drop contrast then white-out
     credits();          if (g_quit) return
     closingLogo()
 }

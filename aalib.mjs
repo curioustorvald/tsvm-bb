@@ -668,6 +668,62 @@ function line(ctx, x0, y0, x1, y1, color) {
     }
 }
 
+// ── backconvert: inverse of render() ────────────────────────────────────────
+// Mirrors bb/backconv.c. Reads (char, attr) cells from the text+attr buffers
+// and writes the matching 4-pixel quadrant back into the image buffer. Used by
+// messager.c's tographics() so devezen* can apply image-domain fade effects to
+// content that was originally typeset in text mode.
+//
+// The C implementation indexes a per-glyph LUT (context->parameters) built at
+// startup. We rebuild the equivalent lazily on first call from GLYPHS.
+let _BC_LUT = null
+function _buildBackconvertLUT() {
+    if (_BC_LUT) return _BC_LUT
+    // 256 entries, each Uint8Array(4) [NW, NE, SW, SE]
+    const lut = new Uint8Array(256 * 4)
+    // Default everything to mid-grey so unknown chars don't render as black.
+    for (let i = 0; i < 256; i++) {
+        lut[i*4+0] = lut[i*4+1] = lut[i*4+2] = lut[i*4+3] = 0
+    }
+    for (let g = 0; g < GLYPHS.length; g++) {
+        const code = _G_CH[g]
+        lut[code*4+0] = _G_Q[g*4+0] | 0
+        lut[code*4+1] = _G_Q[g*4+1] | 0
+        lut[code*4+2] = _G_Q[g*4+2] | 0
+        lut[code*4+3] = _G_Q[g*4+3] | 0
+    }
+    _BC_LUT = lut
+    return lut
+}
+
+function backconvert(ctx, x1, y1, x2, y2) {
+    const lut = _buildBackconvertLUT()
+    const scrW = ctx.scrW
+    const imgW = ctx.imgW
+    const tb = ctx.textbuffer, ab = ctx.attrbuffer, ib = ctx.imagebuffer
+    if (x1 < 0) x1 = 0
+    if (y1 < 0) y1 = 0
+    if (x2 > scrW) x2 = scrW
+    if (y2 > ctx.scrH) y2 = ctx.scrH
+    for (let y = y1; y < y2; y++) {
+        for (let x = x1; x < x2; x++) {
+            const idx = y * scrW + x
+            const ch  = tb[idx] & 0xFF
+            const att = ab[idx]
+            let nw = lut[ch*4+0]
+            let ne = lut[ch*4+1]
+            let sw = lut[ch*4+2]
+            let se = lut[ch*4+3]
+            if (att === AA_REVERSE) { nw = 255-nw; ne = 255-ne; sw = 255-sw; se = 255-se }
+            const ix = x * 2, iy = y * 2
+            ib[iy * imgW + ix]         = nw
+            ib[iy * imgW + ix + 1]     = ne
+            ib[(iy + 1) * imgW + ix]     = sw
+            ib[(iy + 1) * imgW + ix + 1] = se
+        }
+    }
+}
+
 function fillrect(ctx, x, y, w, h, color) {
     const x1 = (x + w) | 0
     const y1 = (y + h) | 0
@@ -716,6 +772,7 @@ exports = {
     print: _print,
     line: line,
     fillrect: fillrect,
+    backconvert: backconvert,
 
     font5x7: font5x7,
     fontFromBitmap: fontFromBitmap,
