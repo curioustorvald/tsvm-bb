@@ -1342,53 +1342,193 @@ function scene7() {
 }
 
 // ============================================================================
-// SCENE 8 — ASCII art pan substitute for the zebra zoom
+// SCENE 8 — near-verbatim port of scene8.c (zebra zoom)
+//
+// The original embeds the 600×470 photo as an LZO-compressed C array (zeb.c)
+// and decompresses at runtime via minilzo. We pre-decoded that into zeb.raw —
+// an 8-bit greyscale dump — so this scene is purely a renderer over the raw
+// pixels. scale()/fastcscale() are ported verbatim from image.c with explicit
+// offsets in place of pointer arithmetic; mydraw() and the 8-phase storyboard
+// mirror scene8.c step-for-step.
 // ============================================================================
-const ZEBRA_ART = (
-    "+------------------------------------------------------------------+\n" +
-    "|             A A   A A     P R O J E C T   1 9 9 7                |\n" +
-    "+------------------------------------------------------------------+\n" +
-    "                                                                    \n" +
-    "         /\\        /\\           /\\        /\\        /\\               \n" +
-    "        /  \\      /  \\         /  \\      /  \\      /  \\              \n" +
-    "       /    \\____/    \\_______/    \\____/    \\____/    \\____         \n" +
-    "      |   .  .  .          .  .          .          .   .   |        \n" +
-    "      |  ASCII   ART    DEMONSTRATION    BY     AA-GROUP    |        \n" +
-    "       \\_____      ____      _____      ____      ______    /        \n" +
-    "            \\____/    \\____/     \\____/    \\____/      \\___/         \n" +
-    "                                                                     \n" +
-    "       8888   8888    Welcome  to  the  text-mode  generation        \n" +
-    "      88   88 88   88     where    every    pixel    is    a         \n" +
-    "      8888888 8888888       letter,    and    every    letter        \n" +
-    "      88   88 88   88           tells   a   tiny   story.            \n" +
-    "      88   88 88   88                                                \n"
-).split("\n")
+const ZEB_W = 600
+const ZEB_H = 470
+let g_zebData = null
+function loadZeb() {
+    if (g_zebData) return g_zebData
+    const path = BB_DIR + "zeb.raw"
+    let fh
+    try { fh = files.open(path) }
+    catch (e) { serial.println("bb: zeb open failed: " + e); return null }
+    if (!fh.exists) { serial.println("bb: zeb.raw not found: " + path); return null }
+    const blob = fh.bread()      // Int8Array of 282000 signed bytes
+    if (!blob || blob.length < ZEB_W * ZEB_H) {
+        serial.println("bb: zeb.raw bad size: " + (blob ? blob.length : "null"))
+        return null
+    }
+    const u = new Uint8Array(ZEB_W * ZEB_H)
+    for (let i = 0; i < u.length; i++) u[i] = blob[i] & 0xFF
+    g_zebData = u
+    return g_zebData
+}
+
+// fastcscale — image.c port. Bresenham-style nearest-neighbour scale of a
+// (x1×y1) source rect into a (x2×y2) dest rect; width1/width2 are the full
+// row strides of source/dest. srcStart/dstStart are byte offsets, replacing
+// the original C pointer arithmetic.
+function _s8Fastcscale(src, srcStart, dst, dstStart, x1, x2, y1, y2, width1, width2) {
+    if (!x1 || !x2 || !y1 || !y2) return
+    let spx = 0, spy = 0
+    let ddx = x1 + x1
+    const ddx1 = x2 + x2
+    if (ddx1 < ddx) { spx = (ddx / ddx1) | 0; ddx %= ddx1 }
+    let ddy = y1 + y1
+    const ddy1 = y2 + y2
+    if (ddy1 < ddy) { spy = ((ddy / ddy1) | 0) * width1; ddy %= ddy1 }
+    const rowSkip = width2 - x2
+    let ey = -ddy1
+    let bb1 = srcStart
+    let b1  = srcStart
+    let b2  = dstStart
+    for (let yy = y2; yy > 0; yy--) {
+        let ex = -ddx1
+        for (let xx = x2; xx > 0; xx--) {
+            dst[b2++] = src[b1]
+            b1 += spx
+            ex += ddx
+            if (ex > 0) { b1++; ex -= ddx1 }
+        }
+        b2 += rowSkip
+        bb1 += spy
+        ey += ddy
+        if (ey > 0) { bb1 += width1; ey -= ddy1 }
+        b1 = bb1
+    }
+}
+
+// scale — image.c port. Maps source rect (x1,y1)-(x2,y2) onto ctx.imagebuffer
+// at full dest resolution. If the source rect extends outside the image, the
+// dest buffer is cleared and only the visible portion is copied — matching
+// scene8.c's wide-zoom phases where the picture shrinks below 100% coverage.
+function _s8Scale(ctx, src, srcW, srcH, x1, y1, x2, y2) {
+    const dst  = ctx.imagebuffer
+    const dstW = ctx.imgW
+    const dstH = ctx.imgH
+    if (x2 < 0 || x1 >= srcW || y2 < 0 || y1 >= srcH) { dst.fill(0); return }
+    if (x1 < 0 || y1 < 0 || x2 >= srcW || y2 >= srcH) {
+        let xx1 = 0, xx2 = dstW - 1, yy1 = 0, yy2 = dstH - 1
+        dst.fill(0)
+        const xstep = dstW / (x2 - x1 - 1)
+        const ystep = dstH / (y2 - y1 - 1)
+        if (x2 >= srcW) { xx2 = ((srcW - 1 - x1) * xstep) | 0; x2 = srcW - 1 }
+        if (y2 >= srcH) { yy2 = ((srcH - 1 - y1) * ystep) | 0; y2 = srcH - 1 }
+        if (x1 < 0)     { xx1 = (-xstep * x1) | 0;             x1 = 0 }
+        if (y1 < 0)     { yy1 = (-ystep * y1) | 0;             y1 = 0 }
+        _s8Fastcscale(src, x1 + srcW * y1,
+                      dst, xx1 + yy1 * dstW,
+                      x2 - x1, xx2 - xx1, y2 - y1, yy2 - yy1,
+                      srcW, dstW)
+        return
+    }
+    _s8Fastcscale(src, x1 + srcW * y1,
+                  dst, 0,
+                  x2 - x1, dstW, y2 - y1, dstH,
+                  srcW, dstW)
+}
 
 function scene8() {
-    clearScreen()
-    const lines = ZEBRA_ART
-    const H = lines.length
-    let maxW = 0
-    for (let i = 0; i < lines.length; i++) if (lines[i].length > maxW) maxW = lines[i].length
-    const okPan = runScene(8000000, 22, function(el, total) {
-        const t = el / total
-        const span = Math.max(0, maxW - TCOLS)
-        const ox = ((Math.sin(t * Math.PI * 2) * 0.5 + 0.5) * span) | 0
-        const oy = (Math.sin(t * Math.PI * 4) * 4) | 0
-        for (let y = 1; y <= TROWS; y++) {
-            const sy = y - 1 + oy
-            let row
-            if (sy < 0 || sy >= H) row = ""
-            else {
-                row = lines[sy]
-                if (row === undefined) row = ""
-                row = row.substring(ox, ox + TCOLS)
-            }
-            while (row.length < TCOLS) row += " "
-            vramPutRow(y, 1, row)
-        }
-    })
-    if (!okPan) return
+    const ctx    = aaCtx()
+    const params = g_aaPar
+    const zeb    = loadZeb()
+    clearScreen(); con.curs_set(0)
+    aa.cleartext(ctx); aa.clear(ctx)
+    if (!zeb) {
+        const msg = "<zeb.raw missing>"
+        runScene(1500000, 20, function() {
+            clearScreen()
+            vramPutRow(((TROWS / 2) | 0), (((TCOLS - msg.length) / 2) | 0) + 1, msg)
+        })
+        return
+    }
+
+    params.dither    = aa.AA_FLOYD_S
+    params.bright    = -255
+    params.contrast  = 100
+    params.randomval = 100
+    g_drawptr     = null
+    g_overlayText = ""
+
+    // Phase state — mirror of scene8.c's module-level xs/xe/ys/ye/...
+    let xs = 300, xe = 300
+    let ys = 400, ye = 400
+    let sxs = 100, sxe = 100
+    let sys0 = 100, sye = 100
+    let cs = 100, ce = 100
+    let bs = -255, be = 0
+    let rs = 100, re = 100
+
+    const demoStartNs = sysNow()
+    let phaseStartNs  = demoStartNs
+    let phaseDurUs    = 0
+
+    // mydraw — exact port of scene8.c::mydraw. STATE1 is "since scene start"
+    // (drives the sin/cos wobble); STATE is "since phase start" (drives the
+    // linear interp between *s and *e endpoints).
+    function mydraw() {
+        const tNs = sysNow()
+        const stateUs  = (tNs - phaseStartNs) / 1000
+        const state1Us = (tNs - demoStartNs)  / 1000
+        const t = phaseDurUs <= 0 ? 1 :
+                  stateUs >= phaseDurUs ? 1 :
+                  stateUs <= 0 ? 0 : stateUs / phaseDurUs
+
+        const cx = (xs + (xe - xs) * t) + Math.sin(state1Us / 300000) * 40
+        const cy = (ys + (ye - ys) * t) + Math.cos(state1Us / 500000) * 40
+        const sx = (sxs + (sxe - sxs) * t) + Math.sin(state1Us / 520000) * 70
+        const sy = (sys0 + (sye - sys0) * t) + Math.cos(state1Us / 700000) * 70
+        params.contrast  = (cs + (ce - cs) * t) | 0
+        params.bright    = (bs + (be - bs) * t) | 0
+        params.randomval = (rs + (re - rs) * t) | 0
+        _s8Scale(ctx, zeb, ZEB_W, ZEB_H,
+            ((cx - sx) * ZEB_W / 1000) | 0,
+            ((cy - sy) * ZEB_H / 1000) | 0,
+            ((cx + sx) * ZEB_W / 1000) | 0,
+            ((cy + sy) * ZEB_H / 1000) | 0)
+    }
+
+    function runPhase(durUs) {
+        phaseStartNs = sysNow()
+        phaseDurUs   = durUs
+        g_drawptr    = mydraw
+        return timestuff(0, null, bbDraw, durUs)
+    }
+
+    // 8-phase storyboard from scene8.c — identical target values & durations.
+    if (!runPhase(2 * 1000000)) return                 // bright -255 → 0
+    bs = be; re = 0
+    if (!runPhase(1 * 1000000)) return                 // randomval 100 → 0
+    rs = re
+    if (!runPhase(5 * 1000000)) return                 // hold
+    sxe = 200; sye = 200
+    xs = xe; ys = ye; xe = 750; ye = 300
+    if (!runPhase(3 * 1000000)) return                 // pan + zoom out
+    xs = xe; ys = ye; sxs = sxe; sys0 = sye
+    ce = 20; sxe = 300; sye = 300
+    if (!runPhase(1 * 1000000)) return                 // contrast 100 → 20
+    cs = ce
+    xs = xe; ys = ye; sxs = sxe; sys0 = sye
+    ye = 400; sxe = 600; sye = 600
+    if (!runPhase(2 * 1000000)) return                 // pan down + zoom way out
+    xs = xe; ys = ye; sxs = sxe; sys0 = sye
+    sxe = 200; sye = 200
+    if (!runPhase(1 * 1000000)) return                 // zoom back in
+    xs = xe; ys = ye; sxs = sxe; sys0 = sye
+    be = 255; sxe = 120; sye = 120
+    if (!runPhase(200000)) return                      // flash white + final zoom
+
+    params.bright   = 0
+    params.contrast = 0
+    g_drawptr       = null
     con.clear()
 }
 
