@@ -1318,7 +1318,7 @@ function renderMandel(cx, cy, zoom, maxIter) {
     }
 }
 
-function scene7() {
+function scene6() {
     clearScreen()
     const KF = [
         { cx: -0.5,         cy:  0.0,    zoom: 1.5,    iter: 18, label: "XaoS - the fast portable realtime fractal zoomer" },
@@ -1341,42 +1341,53 @@ function scene7() {
     con.clear()
 }
 
+function scene7() {
+    clearScreen()
+    // scene6() but Julia set
+    con.clear()
+}
+
 // ============================================================================
-// SCENE 8 — near-verbatim port of scene8.c (zebra zoom)
+// Raw-image pipeline — shared by scene 8 (zebra zoom) and vezen() (portraits)
 //
-// The original embeds the 600×470 photo as an LZO-compressed C array (zeb.c)
-// and decompresses at runtime via minilzo. We pre-decoded that into zeb.raw —
-// an 8-bit greyscale dump — so this scene is purely a renderer over the raw
-// pixels. scale()/fastcscale() are ported verbatim from image.c with explicit
-// offsets in place of pointer arithmetic; mydraw() and the 8-phase storyboard
-// mirror scene8.c step-for-step.
+// The original demo embeds every photo as an LZO-compressed byte array in C
+// source (zeb.c, fk1.c, …) and decompresses at runtime via minilzo. We
+// pre-decode each one into a *.raw asset — a 4-byte header (uint16 LE width,
+// uint16 LE height) followed by W*H bytes of 8-bit luminance — so the runtime
+// path is purely a renderer. fastcscale()/scale()/dispimg() are ported
+// verbatim from image.c, with explicit offsets in place of pointer arithmetic.
 // ============================================================================
-const ZEB_W = 600
-const ZEB_H = 470
-let g_zebData = null
-function loadZeb() {
-    if (g_zebData) return g_zebData
-    const path = BB_DIR + "zeb.raw"
+const _imgCache = {}
+function loadGreyImage(path) {
+    if (_imgCache[path]) return _imgCache[path]
     let fh
     try { fh = files.open(path) }
-    catch (e) { serial.println("bb: zeb open failed: " + e); return null }
-    if (!fh.exists) { serial.println("bb: zeb.raw not found: " + path); return null }
-    const blob = fh.bread()      // Int8Array of 282000 signed bytes
-    if (!blob || blob.length < ZEB_W * ZEB_H) {
-        serial.println("bb: zeb.raw bad size: " + (blob ? blob.length : "null"))
+    catch (e) { serial.println("bb: image open failed: " + path + " - " + e); return null }
+    if (!fh.exists) { serial.println("bb: image not found: " + path); return null }
+    const blob = fh.bread()      // Int8Array
+    if (!blob || blob.length < 4) {
+        serial.println("bb: image truncated: " + path)
         return null
     }
-    const u = new Uint8Array(ZEB_W * ZEB_H)
-    for (let i = 0; i < u.length; i++) u[i] = blob[i] & 0xFF
-    g_zebData = u
-    return g_zebData
+    const w = (blob[0] & 0xFF) | ((blob[1] & 0xFF) << 8)
+    const h = (blob[2] & 0xFF) | ((blob[3] & 0xFF) << 8)
+    const expected = 4 + w * h
+    if (blob.length < expected) {
+        serial.println("bb: image short " + path + ": " + blob.length + " < " + expected)
+        return null
+    }
+    const data = new Uint8Array(w * h)
+    for (let i = 0; i < data.length; i++) data[i] = blob[4 + i] & 0xFF
+    const img = { w: w, h: h, data: data }
+    _imgCache[path] = img
+    return img
 }
 
 // fastcscale — image.c port. Bresenham-style nearest-neighbour scale of a
 // (x1×y1) source rect into a (x2×y2) dest rect; width1/width2 are the full
 // row strides of source/dest. srcStart/dstStart are byte offsets, replacing
 // the original C pointer arithmetic.
-function _s8Fastcscale(src, srcStart, dst, dstStart, x1, x2, y1, y2, width1, width2) {
+function _aaFastcscale(src, srcStart, dst, dstStart, x1, x2, y1, y2, width1, width2) {
     if (!x1 || !x2 || !y1 || !y2) return
     let spx = 0, spy = 0
     let ddx = x1 + x1
@@ -1410,7 +1421,7 @@ function _s8Fastcscale(src, srcStart, dst, dstStart, x1, x2, y1, y2, width1, wid
 // at full dest resolution. If the source rect extends outside the image, the
 // dest buffer is cleared and only the visible portion is copied — matching
 // scene8.c's wide-zoom phases where the picture shrinks below 100% coverage.
-function _s8Scale(ctx, src, srcW, srcH, x1, y1, x2, y2) {
+function _aaScale(ctx, src, srcW, srcH, x1, y1, x2, y2) {
     const dst  = ctx.imagebuffer
     const dstW = ctx.imgW
     const dstH = ctx.imgH
@@ -1424,22 +1435,56 @@ function _s8Scale(ctx, src, srcW, srcH, x1, y1, x2, y2) {
         if (y2 >= srcH) { yy2 = ((srcH - 1 - y1) * ystep) | 0; y2 = srcH - 1 }
         if (x1 < 0)     { xx1 = (-xstep * x1) | 0;             x1 = 0 }
         if (y1 < 0)     { yy1 = (-ystep * y1) | 0;             y1 = 0 }
-        _s8Fastcscale(src, x1 + srcW * y1,
+        _aaFastcscale(src, x1 + srcW * y1,
                       dst, xx1 + yy1 * dstW,
                       x2 - x1, xx2 - xx1, y2 - y1, yy2 - yy1,
                       srcW, dstW)
         return
     }
-    _s8Fastcscale(src, x1 + srcW * y1,
+    _aaFastcscale(src, x1 + srcW * y1,
                   dst, 0,
                   x2 - x1, dstW, y2 - y1, dstH,
                   srcW, dstW)
 }
 
+// dispimg — image.c port. Picks a centre-cropped sub-rect of img whose aspect
+// matches the screen's physical aspect, then scales it across the entire
+// image buffer. Used by vezen() to fill the screen with a portrait.
+//
+// aalib.mjs counts mm in cell units (mmW=scrW, mmH=scrH), which implicitly
+// treats text cells as square. TSVM cells are 7×14 px — twice as tall as
+// they are wide — so we multiply mmH by 14/7 to recover the true physical
+// aspect. Without this, portraits would render ~half as wide as the original
+// BB demo intended (whose 8×8 cells were genuinely square).
+const _TSVM_CELL_HW = 14 / 7
+function _aaDispimg(ctx, img) {
+    const srcW = img.w, srcH = img.h
+    const mmW = aa.mmwidth(ctx)
+    const mmH = aa.mmheight(ctx) * _TSVM_CELL_HW
+    let x2, y2
+    if ((srcW * mmH / mmW) > srcH) {
+        x2 = srcW
+        y2 = (srcW * mmH / mmW) | 0
+    } else {
+        x2 = (srcH * mmW / mmH) | 0
+        y2 = srcH
+    }
+    const x1 = ((srcW - x2) / 2) | 0
+    const y1 = ((srcH - y2) / 2) | 0
+    _aaScale(ctx, img.data, srcW, srcH, x1, y1, x1 + x2, y1 + y2)
+}
+
+// ============================================================================
+// SCENE 8 — near-verbatim port of scene8.c (zebra zoom)
+//
+// scale()/fastcscale() above are the same primitives the original calls;
+// mydraw() and the 8-phase storyboard mirror scene8.c step-for-step.
+// ============================================================================
+
 function scene8() {
     const ctx    = aaCtx()
     const params = g_aaPar
-    const zeb    = loadZeb()
+    const zeb    = loadGreyImage(BB_DIR + "zeb.raw")
     clearScreen(); con.curs_set(0)
     aa.cleartext(ctx); aa.clear(ctx)
     if (!zeb) {
@@ -1450,6 +1495,7 @@ function scene8() {
         })
         return
     }
+    const ZEB_W = zeb.w, ZEB_H = zeb.h
 
     params.dither    = aa.AA_FLOYD_S
     params.bright    = -255
@@ -1489,7 +1535,7 @@ function scene8() {
         params.contrast  = (cs + (ce - cs) * t) | 0
         params.bright    = (bs + (be - bs) * t) | 0
         params.randomval = (rs + (re - rs) * t) | 0
-        _s8Scale(ctx, zeb, ZEB_W, ZEB_H,
+        _aaScale(ctx, zeb.data, ZEB_W, ZEB_H,
             ((cx - sx) * ZEB_W / 1000) | 0,
             ((cy - sy) * ZEB_H / 1000) | 0,
             ((cx + sx) * ZEB_W / 1000) | 0,
@@ -1593,45 +1639,25 @@ function scene910() {
 // Portraits, vezen, messager, devezen — near-verbatim ports of scene1.c:vezen,
 // messager.c:messager, and messager.c:devezen1..4.
 //
-// Portrait images: the original loads BW image files and dispimg()'s them into
-// the image buffer. We keep our pre-rendered ASCII portrait .txt files: each
-// is written straight into the aalib textbuffer, and a backconvert() pass
-// projects the cell-mode portrait back into the image buffer so the image-
-// domain strobik fade + devezen wipes operate on it the same way as in C.
+// Portrait images: the original ships each mugshot as an LZO-compressed C
+// array (fk1.c, hh2.c, …) and runtime-decompresses + dispimg()s into the
+// image buffer. We pre-decoded those into *.raw assets (see decode_images.c)
+// and feed them through the same _aaDispimg path scene8 uses; the strobik
+// fades and devezen wipes then operate on real pixels exactly as in C.
 // ============================================================================
-function loadPortrait(path) {
-    let fh
-    try { fh = files.open(path) } catch (e) { return null }
-    if (!fh.exists) return null
-    const data = fh.sread()
-    if (!data) return null
-    const lines = data.split("\n")
-    const header = lines[0].split(" ")
-    const cols = (header[0] | 0)
-    const rows = (header[1] | 0)
-    if (!cols || !rows) return null
-    return { cols: cols, rows: rows, lines: lines.slice(1, 1 + rows) }
+function loadPortrait(name) {
+    return loadGreyImage(BB_DIR + name + ".raw")
 }
 
-// Write a portrait into the aalib text+attr buffer (centred), then mirror it
-// into the image buffer via backconvert so the strobik fade has something to
-// render. After this, aa.render(image→text) reproduces the portrait — that's
-// what bbDraw drives during strobikend.
-function loadPortraitToBuffer(p) {
+// Centre-crop the portrait into ctx.imagebuffer at full screen resolution.
+// The textbuffer is cleared as a side-effect; bbDraw → aa.render rebuilds it
+// from the image buffer on the next frame.
+function loadPortraitToBuffer(img) {
     const ctx = aaCtx()
     aa.cleartext(ctx)
     aa.clear(ctx)
-    if (!p) return
-    const scrW = aa.scrwidth(ctx), scrH = aa.scrheight(ctx)
-    const x0 = ((scrW - p.cols) / 2) | 0
-    const y0 = ((scrH - p.rows) / 2) | 0
-    for (let i = 0; i < p.rows; i++) {
-        const row = p.lines[i] || ""
-        const yy = y0 + i
-        if (yy < 0 || yy >= scrH) continue
-        aa.puts(ctx, x0 < 0 ? 0 : x0, yy, aa.AA_NORMAL, row)
-    }
-    aa.backconvert(ctx, 0, 0, scrW, scrH)
+    if (!img) return
+    _aaDispimg(ctx, img)
 }
 
 // vezen(set) — exact mirror of scene1.c:vezen(): for each of 4 portraits, a
@@ -1643,7 +1669,7 @@ function vezen(set) {
     for (let i = 1; i <= 4; i++) {
         if (g_quit) return
         strobikstart()
-        const p = loadPortraitToBuffer(loadPortrait(BB_DIR + set + i + ".txt"))
+        loadPortraitToBuffer(loadPortrait(set + i))
         strobikend()
         if (i < 4) {
             if (!bbwait(500000)) return
@@ -2084,6 +2110,7 @@ function main() {
     messager(BIO_MS);   if (g_quit) return
     devezen3()          // noise-up then fade to black
     scene8();           if (g_quit) return
+    scene6();           if (g_quit) return
     vezen("kt");        if (g_quit) return
     messager(BIO_KT);   if (g_quit) return
     devezen1()          // two-buffer scroll wipe
