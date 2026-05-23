@@ -11,6 +11,7 @@
  */
 
 const taud = require("taud")
+const lfs  = require("lfs")
 
 // ============================================================================
 // Asset directory — relative to the current drive
@@ -28,6 +29,19 @@ function _resolveBBDir() {
 const BB_DIR = _resolveBBDir()
 
 const aa = require(BB_DIR+"aa.mjs")
+
+// ============================================================================
+// Data assets live inside bb-assets.lfs and are unpacked to a fresh $:/TMP
+// directory on first run. lfs.extractAll transparently decompresses zstd/gzip
+// payloads, but keeps the archived leaf names — so e.g. `zeb.raw.zst` ends up
+// as a file literally named `zeb.raw.zst` whose contents are the inflated
+// `.raw` bytes. The loaders below read by path, so the extension on disk is
+// just a label — no rename pass is needed.
+// ============================================================================
+const ASSETS_DIR = (function() {
+    const dir = lfs.extractAll(BB_DIR + "bb-assets.lfs")
+    return dir.fullPath + "\\"
+})()
 
 // ============================================================================
 // Terminal geometry & globals
@@ -1308,7 +1322,7 @@ function _3dPrecalc() {
 // face*3 + vertex without object churn.
 function _3dReadPoly(name) {
     let fh
-    try { fh = files.open(BB_DIR + name + ".poly") }
+    try { fh = files.open(ASSETS_DIR + name + ".poly.zst") }
     catch (e) { serial.println("bb: poly open failed: " + name + " - " + e); return null }
     if (!fh.exists) { serial.println("bb: poly missing: " + name); return null }
     const blob = fh.bread()
@@ -2524,7 +2538,7 @@ function _aaDispimg(ctx, img) {
 function scene8() {
     const ctx    = aaCtx()
     const params = g_aaPar
-    const zeb    = loadGreyImage(BB_DIR + "zeb.raw")
+    const zeb    = loadGreyImage(ASSETS_DIR + "zeb.raw.zst")
     clearScreen(); con.curs_set(0)
     aa.cleartext(ctx); aa.clear(ctx)
     if (!zeb) {
@@ -2767,7 +2781,7 @@ function scene10() {
 // fades and devezen wipes then operate on real pixels exactly as in C.
 // ============================================================================
 function loadPortrait(name) {
-    return loadGreyImage(BB_DIR + name + ".raw")
+    return loadGreyImage(ASSETS_DIR + name + ".raw.zst")
 }
 
 // Centre-crop the portrait into ctx.imagebuffer at full screen resolution.
@@ -3096,7 +3110,7 @@ function credits() {
 
     clearScreen()
     aa.cleartext(ctx); aa.clear(ctx); aa.flush(ctx)
-    loadSong(BB_DIR + "bb2.taud")
+    loadSong(ASSETS_DIR + "bb2.taud")
 
     // ── #defines from credits.c ────────────────────────────────────────────
     const STAR = 1, SLOWDOWN = 2, NORMAL = 3, WIND = 4
@@ -3429,7 +3443,7 @@ function main() {
 
     // Pre-load the song; playback is kicked off mid-scene1, exactly where the
     // C scene1.c calls play() (between the scramble phases and "AA PRESENTS").
-    loadSong(BB_DIR + "bb.taud")
+    loadSong(ASSETS_DIR + "bb.taud")
 
     // Scene order + devezen variant per bio match bb.c's bb() loop.
     scene1();           if (g_quit) return
