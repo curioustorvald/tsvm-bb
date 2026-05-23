@@ -27,7 +27,7 @@ function _resolveBBDir() {
 }
 const BB_DIR = _resolveBBDir()
 
-const aa = require(BB_DIR+"aalib.mjs")
+const aa = require(BB_DIR+"aa.mjs")
 
 // ============================================================================
 // Terminal geometry & globals
@@ -53,23 +53,18 @@ let g_skip  = false
 // ============================================================================
 let g_aa      = null
 let g_aaPar   = null
-let g_aaFont  = null  // TSVM 7x14 system font (lazy-loaded)
+// aaFont() returns the TSVM 7x14 system font, used both by aa.print() for
+// typesetting big text into the image buffer AND (via init()'s default) by
+// AAlib's glyph-selection LUT. The embedded copy in aalib.mjs is the same
+// byte layout as tsvm_font.chr, so it stays in sync with the hardware text
+// mode automatically.
+function aaFont() { return aa.aa_tsvm_font }
 function aaCtx() {
     if (!g_aa) {
         g_aa    = aa.init(TCOLS, TROWS)
         g_aaPar = aa.getrenderparams()
     }
     return g_aa
-}
-function aaFont() {
-    if (!g_aaFont) {
-        try { g_aaFont = aa.loadChrFont(BB_DIR + "tsvm_font.chr", 7, 14) }
-        catch (e) {
-            serial.println("bb: tsvm_font.chr load failed (" + e + "), falling back to 5x7")
-            g_aaFont = aa.font5x7()
-        }
-    }
-    return g_aaFont
 }
 
 function sysNow() { return sys.nanoTime() }
@@ -3079,128 +3074,340 @@ const BIO_HH = (
 )
 
 // ============================================================================
-// Credits — starfield + scroller
+// Credits — near-verbatim port of credits.c
+//
+// Four timestuff phases at 60 Hz drive a starfield:
+//   STAR     (6 s) — bright fades -255 → 0, stars approach (windz = -30)
+//   SLOWDOWN (4 s) — windz ramps -30 → 0 across the phase
+//   NORMAL   (8 s) — wobble (horiztab/verttab) but no z motion
+//   WIND     (TOTAL) — random gusts (windspeed/windangle); credits scroll on top
+//
+// CTIME = 3 s per credit lifespan, CTIME1 = 0.5 s between spawns, so NCREDITS=6
+// captions are visible at any moment. xpos1/xpos2 alternate by parity and
+// wobble around imgW/2 via sin(state · π / 900000). In the final CTIME of WIND
+// params.randomval ramps 0 → 800 for the noise fade-out.
 // ============================================================================
 function credits() {
-    clearScreen()
-    loadSong(BB_DIR + "bb2.taud"); startMusic()
+    const ctx    = aaCtx()
+    const params = g_aaPar
+    const font   = aaFont()
+    const imgW = aa.imgwidth(ctx),  imgH = aa.imgheight(ctx)
+    const mmW  = aa.mmwidth(ctx),   mmH  = aa.mmheight(ctx)
 
-    const NSTARS = 90
-    const MAXFAR = 1000
-    const stars = []
-    function spawnStar(i) {
-        stars[i] = {
-            x: (Math.random() - 0.5) * 800,
-            y: (Math.random() - 0.5) * 800,
-            z: Math.random() * MAXFAR + 1,
+    clearScreen()
+    aa.cleartext(ctx); aa.clear(ctx); aa.flush(ctx)
+    loadSong(BB_DIR + "bb2.taud")
+
+    // ── #defines from credits.c ────────────────────────────────────────────
+    const STAR = 1, SLOWDOWN = 2, NORMAL = 3, WIND = 4
+    const MAXSTARS  = 450
+    const MAXFAR    = 1000
+    const MAXFAR1   = 100000
+    const GFARCOR   = 256
+    const MAXLEFT   = -(MAXFAR * 255)
+    const MAXRIGHT  =  (MAXFAR * 255)
+    const MAXTOP    = -(MAXFAR * 255)
+    const MAXBOTTOM =  (MAXFAR * 255)
+    const G         = 600
+    const SSPEED    = 40
+    const SSPEED1   = 50
+    const TABSIZE   = 60 * 2
+    const NCREDITS  = 6
+    const CTIME     = 3000000
+    const CTIME1    = (CTIME / NCREDITS) | 0     // 500 000 µs
+
+    // ── text[] from credits.c (verbatim, in order) ─────────────────────────
+    const text = [
+        "Thank you","For","watching","BB",".","...",".",
+        "CREDITS:"," ",
+        "FK:","Music"," "," ",
+        "MS:","3d engine","tyre"," "," ",
+        "KT:","Sound","engine","Sound","synchro","Intro","Plasma",
+        "Guard","stone","Texts","Titles","Stars","Snowing"," "," ",
+        "HH:","AAlib","Intro","Invaders","Fire","Greetings","Photos",
+        "XaoS","Zebra","Titeling","Texts","Snowing","Timing","system",
+        "Outro","Pc speaker","driver"," ",
+        ".","...",".",
+        "Special","Thanks","to",":",
+        "Eva","Hubickova","for photos"," ",
+        "Texas","Linux","users","group","Their","logo","- great",
+        "inspiration"," ",
+        "Thomas","Marsh","For help","with","fractal","zooming"," ",
+        "IBM","for MDA","the","primary","gfx","target"," ",
+        "Jiri","Matousek","for help","with","searching","algorithm"," ",
+        "0rfelyus","for help","with","dithering"," ",
+        "DJ","for DJGPP"," ",
+        "MikMak","for MikMod"," ",
+        "Richard","Stallman","for GNU"," ",
+        "Linus","Torvalds","for linux",
+        ".","...",".",
+        "This demo","and","ascii art","library","is free","software",
+        "...",
+        "you can","redistribute","it","and/or","modify","under",
+        "terms","of GNU","General","Public","Licence","as","published",
+        "by the","Free","Software","Foundation"," ",
+        ".","...",".",
+        "see","COPYING","for","details","or","README","for","pointer",
+        "to","sources"," "," ",
+        "! WARNING !","Do NOT","read","the sources","unless",
+        "you really","know","what you","are doing",
+        ".","...",".",
+        "(C)1997","AA","(C)2026","CuriousTorvald",
+    ]
+    const CSIZE = text.length
+    const TOTAL = CTIME1 * CSIZE + CTIME     // µs
+
+    // ── Mutable file-statics ───────────────────────────────────────────────
+    let mode      = STAR
+    let windx     = 0
+    let windz     = -30
+    let windspeed = 0, tospeed = 0
+    let windangle = 0, toangle = 0
+    let counter   = 0
+
+    // Phase clock — timestuff() doesn't expose its starttime/endtime, so each
+    // phase records its own start ns + duration µs for state-time queries.
+    let phaseStart = 0
+    let phaseDur   = 0
+    function phaseTime() { return ((sysNow() - phaseStart) / 1000) | 0 }   // µs
+
+    // ── precalculate() ─────────────────────────────────────────────────────
+    const horiztab = new Int32Array(TABSIZE)
+    const verttab  = new Int32Array(TABSIZE)
+    {
+        let p1 = (MAXLEFT / SSPEED) | 0
+        for (let i = 0; i < TABSIZE; i++) {
+            const p = (Math.cos(i * 2 * Math.PI / (TABSIZE - 1)) * MAXLEFT / SSPEED) | 0
+            horiztab[i] = p - p1
+            p1 = p
+        }
+        p1 = 0
+        for (let i = 0; i < TABSIZE; i++) {
+            const p = (Math.abs(Math.sin(i * 2 * Math.PI / TABSIZE) * MAXLEFT / SSPEED1) + i * G) | 0
+            verttab[i] = p - p1
+            p1 = p
         }
     }
-    for (let i = 0; i < NSTARS; i++) spawnStar(i)
 
-    const CREDITS = [
-        "THANK YOU", "FOR", "WATCHING", "BB", "...", "CREDITS",
-        "FK:", "MUSIC",
-        "MS:", "3D ENGINE", "TYRE",
-        "KT:", "SOUND ENGINE", "PLASMA", "STARS", "SNOWING",
-        "HH:", "AALIB", "INVADERS", "FIRE", "GREETINGS",
-        "PHOTOS", "XAOS", "ZEBRA", "TIMING", "OUTRO",
-        "...",
-        "SPECIAL THANKS",
-        "EVA HUBICKOVA", "FOR PHOTOS",
-        "TEXAS LINUX USERS GROUP", "INSPIRATION",
-        "THOMAS MARSH", "FRACTAL ZOOMING",
-        "IBM", "FOR MDA", "THE PRIMARY", "GFX TARGET",
-        "MIKMAK", "MIKMOD",
-        "RICHARD STALLMAN", "GNU",
-        "LINUS", "LINUX",
-        "...",
-        "PORTED TO TSVM", "CURIOUSTORVALD", "2026",
-        "(C) 1997 AA",
-    ]
-    const CTIME_MS = 800
-    const TOTAL_MS = CTIME_MS * (CREDITS.length + 4)
+    // ── Starfield (s[MAXSTARS]) ────────────────────────────────────────────
+    const sx  = new Int32Array(MAXSTARS)
+    const sy  = new Int32Array(MAXSTARS)
+    const sz  = new Int32Array(MAXSTARS)
+    const sx2 = new Int32Array(MAXSTARS)
+    const sy2 = new Int32Array(MAXSTARS)
 
-    const okCred = runScene(TOTAL_MS * 1000, 18, function(el, dur) {
-        // move + project stars
-        for (let i = 0; i < NSTARS; i++) {
-            let s = stars[i]
-            s.z -= 30  // approach the viewer
-            if (s.z <= 1) { spawnStar(i); s = stars[i] }
-            const sx = (((s.x - 256) / s.z) * TCOLS) | 0
-            const sy = (((s.y - 256) / s.z) * TCOLS * 0.5) | 0
-            s._sx = sx + HALF_W
-            s._sy = sy + HALF_H
+    function createStar(i) {
+        sx[i]  = (Math.random() * 2 * MAXRIGHT  + MAXLEFT) | 0
+        sy[i]  = (Math.random() * 2 * MAXBOTTOM + MAXTOP)  | 0
+        sx2[i] = imgW >> 1
+        sy2[i] = imgH >> 1
+        sz[i]  = (Math.random() * 2 * MAXFAR + 1) | 0
+    }
+    function projectStar(i) {
+        const z = sz[i]
+        sx2[i] = (((((sx[i] - 256) / z) * imgW) | 0) >> 8) + (imgW >> 1)
+        sy2[i] = (((((sy[i] - 256) / z) * imgW * mmH / mmW) | 0) >> 8) + (imgH >> 1)
+    }
+    for (let i = 0; i < MAXSTARS; i++) createStar(i)
+
+    function drawStarfield() {
+        aa.clear(ctx)
+        for (let i = 0; i < MAXSTARS; i++) {
+            const x2 = sx2[i], y2 = sy2[i]
+            if (x2 > 0 && x2 < imgW && y2 > 0 && y2 < imgH) {
+                const v = (MAXFAR1 / Math.max(1, sz[i] - GFARCOR)) | 0
+                aa.putpixel(ctx, x2, y2, v > 255 ? 255 : v)
+            }
         }
-        con.clear()
-        for (let i = 0; i < NSTARS; i++) {
-            const s = stars[i]
-            if (s._sx == null) continue
-            if (s._sx < 0 || s._sx >= TCOLS) continue
-            if (s._sy < 0 || s._sy >= TROWS) continue
-            const intensity = MAXFAR / Math.max(1, s.z)
-            const ch = intensity > 1.5 ? 0xFE : intensity > 0.7 ? 0x2A : 0x2E
-            putCh(s._sy + 1, s._sx + 1, ch)
+        aa.putpixel(ctx, imgW >> 1, imgH >> 1, 0)
+    }
+
+    function moveStarfield(step) {
+        for (; step; step--) {
+            if (mode === SLOWDOWN) {
+                const elapsed = phaseTime()
+                const remain  = phaseDur - elapsed
+                windz = (-30 * remain / phaseDur) | 0
+            }
+            if (mode === WIND) {
+                if (windspeed >= tospeed) {
+                    windspeed -= 0.05
+                    if (windspeed <= tospeed)
+                        tospeed = ((Math.random() * 40) | 0) - 10
+                    if (tospeed < 0) tospeed = 0
+                }
+                if (windspeed < tospeed) windspeed += 0.05
+                if (windangle <= toangle) {
+                    windangle += 1.0 / 200.0
+                    if (windangle >= toangle)
+                        toangle = -Math.PI * 2 / 3 + ((Math.random() * 1000) | 0) * Math.PI / 1000.0 * 4 / 3
+                }
+                if (windangle >= toangle) windangle -= 1.0 / 200.0
+                windx = (Math.sin(windangle) * windspeed * 100) | 0
+                windz = (-Math.cos(windangle) * windspeed)     | 0
+            }
+            counter++
+            for (let i = 0; i < MAXSTARS; i++) {
+                if (step === 1) {
+                    if (sz[i]) projectStar(i)
+                    while (!(sx2[i] > -imgW / 3 && sx2[i] < 4 * imgW / 3 &&
+                             sy2[i] > -imgH / 3 && sy2[i] < 4 * imgH / 3 &&
+                             sz[i] > 0 && sz[i] <= MAXFAR)) {
+                        createStar(i)
+                        projectStar(i)
+                    }
+                }
+                if (mode !== STAR) {
+                    sx[i] += horiztab[(counter + i) % TABSIZE] + windx
+                    sy[i] += verttab[(counter + i) % TABSIZE]
+                }
+                sz[i] += windz
+            }
         }
-        // scroll captions
-        const elMs = el / 1000
-        for (let i = 0; i < CREDITS.length; i++) {
-            const localMs = elMs - i * CTIME_MS
-            if (localMs < 0 || localMs > CTIME_MS * 3) continue
-            const yf = TROWS - (localMs / (CTIME_MS * 3)) * (TROWS + 6)
-            const y = yf | 0
-            if (y < 1 || y > TROWS) continue
-            setFG(WHITE)
-            bigText(y, CREDITS[i], 1)
+    }
+
+    function drawCredits() {
+        const state  = phaseTime()
+        const pos    = Math.sin(state * Math.PI / 900000)
+        const xpos1  = (imgW / 2 + pos * 0.16 * imgW) | 0
+        const xpos2  = (imgW / 2 - pos * 0.16 * imgW) | 0
+        const height = (imgH / NCREDITS) | 0
+        drawStarfield()
+        let time = 0
+        for (let i = 0; i < CSIZE; i++) {
+            if (state > time && state < time + CTIME) {
+                const y = -height + (imgH + 2 * height) * (CTIME + time - state) / CTIME
+                _s1Centerprint(ctx, font,
+                    (i & 1) ? xpos1 : xpos2,
+                    y | 0,
+                    NCREDITS - 2,
+                    255,
+                    text[i])
+            }
+            time += CTIME1
         }
-    })
-    if (!okCred) return
-    con.clear()
+        if (state > TOTAL - CTIME) {
+            params.randomval = ((state - TOTAL + CTIME) * 800 / CTIME) | 0
+        }
+    }
+
+    function mydraw1() {
+        if (mode === STAR) {
+            const elapsed = phaseTime()
+            if (elapsed < phaseDur) {
+                params.bright = -255 + ((elapsed * 255 / phaseDur) | 0)
+            } else {
+                params.bright = 0
+            }
+        } else {
+            params.bright = 0
+        }
+        drawStarfield()
+    }
+
+    // ── Run the four phases — order/durations match credits.c:credits() ────
+    params.bright    = -255
+    params.dither    = aa.AA_NONE
+    params.randomval = 0
+    g_overlayText    = ""
+    g_drawptr        = mydraw1
+    startMusic()
+
+    function runPhase(durUs) {
+        phaseStart = sysNow()
+        phaseDur   = durUs
+        timestuff(-60, moveStarfield, bbDraw, durUs)
+    }
+
+    mode = STAR;     runPhase(6000000); if (g_quit) return
+    mode = SLOWDOWN; runPhase(4000000); if (g_quit) return
+    mode = NORMAL;   runPhase(8000000); if (g_quit) return
+
+    mode = WIND
+    params.bright = 0
+    g_drawptr = drawCredits
+    runPhase(TOTAL)
+
+    g_drawptr        = null
+    params.randomval = 0
+    params.bright    = 0
+    clearScreen()
 }
 
 // ============================================================================
-// Closing logo (clipped credits2 — no interactive text reader)
+// Closing logo — port of credits2.c:pryc() ("Flying 'The END'").
+// The original credits2() also ran a typed displogo animation and a wall-of-
+// text navigator after pryc; both are dropped (AA-project is long gone and the
+// scrolling credits are no longer relevant).
 // ============================================================================
 function closingLogo() {
+    const ctx    = aaCtx()
+    const params = g_aaPar
+    const font   = aaFont()
+    const imgW = aa.imgwidth(ctx), imgH = aa.imgheight(ctx)
+
     clearScreen()
-    // loadSong(BB_DIR + "bb3.taud"); startMusic() // we'll just show the animated logo then quit. Even in the "real" version.
+    aa.cleartext(ctx); aa.clear(ctx); aa.flush(ctx)
 
-    // Build a vertical "8 8" growing from below.
-    const LOGOH = 7
-    const yStart = TROWS - 2
-    const xMid = HALF_W - 1
-    for (let i = 0; i <= LOGOH; i++) {
-        if (g_quit) return
-        con.clear()
-        for (let r = 0; r < i; r++) {
-            const yy = yStart - r
-            if (yy >= 1) drawText(yy, xMid, "8  8")
-        }
-        if (!waitMs(120)) return
+    const MAXTIME = 2500000
+
+    let phaseStart = 0
+    function phaseTime() { return ((sysNow() - phaseStart) / 1000) | 0 }
+
+    // decrand — credits2.c:decrand(). Fades randomval from 1600 → 0 over the
+    // first 4 s of the static-text phase so "The/END" emerges from noise.
+    function decrand() {
+        const STATE = phaseTime()
+        if (STATE < 4000000) params.randomval = ((4000000 - STATE) * 1600 / 4000000) | 0
+        else                 params.randomval = 0
     }
-    drawText((TROWS / 2) | 0, ((TCOLS - 18) / 2 | 0) + 1, "<PROJECT><PROJECT>")
-    if (!waitMs(700)) return
 
-    const banner = [
-        "                               dT8  8Tb                       ",
-        "                              dT 8  8 Tb                      ",
-        "                             dT  8  8  Tb                     ",
-        "                          <PROJECT><PROJECT>                  ",
-        "                           dT    8  8    Tb                   ",
-        "                          dT     8  8     Tb                  ",
-    ]
-    const okBan = runScene(3500000, 20, function(el) {
-        con.clear()
-        const yTop = ((TROWS - banner.length) / 2 | 0) + 1
-        for (let i = 0; i < banner.length; i++) drawText(yTop + i, 1, banner[i])
-        if (((el / 200000) | 0) % 2) drawText(yTop + 3, 1, banner[3])
-    })
-    if (!okBan) return
+    // pryc — both words spiral outward while their font size grows.
+    function pryc() {
+        const STATE   = phaseTime()
+        const size    = 3 + STATE * 10.0 / MAXTIME
+        const radius  = STATE * imgW / MAXTIME
+        const yradius = STATE * imgH / MAXTIME
+        const xm = imgW / 2
+        const ym = imgH / 3
+        aa.clear(ctx)
+        _s1Centerprint(ctx, font,
+            (xm + radius  * Math.sin(STATE / 100000.0)) | 0,
+            (ym + yradius * Math.cos(STATE / 300000.0)) | 0,
+            size, 128, "The")
+        _s1Centerprint(ctx, font,
+            (xm     + radius  * Math.sin(STATE / 150000.0)) | 0,
+            (2 * ym + yradius * Math.cos(STATE / 400000.0)) | 0,
+            size, 128, "END")
+    }
 
-    runScene(3000000, 12, function(el) {
-        con.clear()
-        bigText(HALF_H - 2, "END", 3)
-        if (((el / 200000) | 0) % 2) bigText(HALF_H + 4, "(C) 1997 AA", 1)
-    })
+    // Lay down the static "The" / "END" once; decrand only nudges randomval.
+    aa.clear(ctx)
+    _s1Centerprint(ctx, font, (imgW / 2) | 0, (imgH / 3)     | 0, 3, 128, "The")
+    _s1Centerprint(ctx, font, (imgW / 2) | 0, (2 * imgH / 3) | 0, 3, 128, "END")
+
+    params.dither    = aa.AA_NONE
+    params.bright    = 0
+    params.randomval = 50
+    g_overlayText    = ""
+
+    g_drawptr  = decrand
+    phaseStart = sysNow()
+    timestuff(0, null, bbDraw, 5000000)
+    if (g_quit) { g_drawptr = null; params.randomval = 0; return }
+
+    g_drawptr        = null
+    params.randomval = 0
+
+    g_drawptr  = pryc
+    phaseStart = sysNow()
+    timestuff(0, null, bbDraw, MAXTIME)
+
+    g_drawptr = null
+    aa.clear(ctx)
+    bbDraw()
+
+    waitMs(1000) // a cushion to prevent abrupt cut right after pryc
 }
 
 // ============================================================================
