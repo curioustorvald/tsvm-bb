@@ -16,19 +16,9 @@ const lfs  = require("lfs")
 // ============================================================================
 // Asset directory — relative to the current drive
 // ============================================================================
-function _resolveBBDir() {
-    // Prefer the same drive as the running script. /home/bb/ is the package
-    // location (matches hop.per's expectation for a HopperProvides:bb pkg).
-    try {
-        const r = _G.shell.resolvePathInput("/home/bb")
-        return r.drive + ":/home/bb/"
-    } catch (e) {
-        return "A:/home/bb/"
-    }
-}
-const BB_DIR = _resolveBBDir()
+const BB_DIR = _G.shell.getFileDir()
 
-const aa = require(BB_DIR+"aa.mjs")
+const aa = require("aa")
 
 // ============================================================================
 // Data assets live inside bb-assets.lfs and are unpacked to a fresh $:/TMP
@@ -39,7 +29,7 @@ const aa = require(BB_DIR+"aa.mjs")
 // just a label — no rename pass is needed.
 // ============================================================================
 const ASSETS_DIR = (function() {
-    const dir = lfs.extractAll(BB_DIR + "bb-assets.lfs")
+    const dir = lfs.extractAll(BB_DIR + "/bb-assets.lfs")
     return dir.fullPath + "\\"
 })()
 
