@@ -29,8 +29,11 @@
  *     the original AAlib: render() never produces it, but puts()/flush()
  *     route it to a distinct foreground hue.
  *   - aa.print(), aa.line(), aa.fillrect(), aa.backconvert(),
- *     fontFromBitmap(), loadChrFont() are TSVM extensions kept from the
- *     previous port — they operate on the image buffer.
+ *     fontFromBitmap(), loadChrFont(), loadChrFontROM() are TSVM extensions
+ *     kept from the previous port — they operate on the image buffer.
+ *   - There is no embedded default font: callers must load one (typically via
+ *     loadChrFontROM() pointed at a font ROM in the format produced by
+ *     tvdos/tuidev/font_rom_builder.c) and pass it to aa.init() as opts.font.
  */
 
 // ── Attribute constants ─────────────────────────────────────────────────────
@@ -68,70 +71,6 @@ const _DEFAULT_DIMMUL  = 5.3
 const _DEFAULT_BOLDMUL = 2.7
 const _DEFAULT_SUPPORTED = AA_NORMAL_MASK | AA_DIM_MASK | AA_BOLD_MASK
 
-// ── Embedded font ───────────────────────────────────────────────────────────
-// TSVM system font (7x14 character ROM, 3584 bytes, base64-encoded). Stored
-// row-major, one byte per row with the leftmost pixel at bit 6. This is the
-// same byte format as tsvm_font.chr on disk and as GraphicsAdapter.kt's
-// character ROM, so the glyph-selection brightness profile computed by
-// aa_calcparams() is consistent with what the hardware text mode draws.
-const _TSVM_FONT_B64 = "AAAAAAAAAAAAAAAAAAAAAD5BVUFBXU1BPgAAAAAAPn9rf39jc38+AAAAAAAANn9/f38+HAgAAAAAAAAIHD5/PhwIAAAAAAAACBwcNnc2CAgcAAAAAAAIHD5/fz4ICBwAAAAAAAAAHD4+PhwAAAAAAH9/f39jQUFBY39/f39/AAAAABw2IjYcAAAAAAB/f39/Y0ldSWN/f39/fwAADwcNGTxmZmY8AAAAAAA8ZmZmPBh+GBgAAAAAAB8ZHxgYGDh4cAAAAAAAPzE/MTExM3d2YAAAAAAAAFo0YmI0WgAAAAAAQGBweHx+fnx4cGBAAAABAwcPHz8/Hw8HAwEAAAAYPH4YGBh+PBgAAAAAAGZmZmZmAABmZgAAAAAAP2trazsLCwsLAAAAAD5jMBw2Y2M2HAZjPgAAAAAAAAAAAH9/fwAAAAAAGDx+GBgYfjwYfgAAAAAYPH4YGBgYGBgAAAAAABgYGBgYGH48GAAAAAAAAAAMBn8GDAAAAAAAAAAAABgwfzAYAAAAAAAAAAAAAGBgYH8AAAAAAAAAAAAUNn82FAAAAAAAAAAACBwcPj5/fwAAAAAAAAB/fz4+HBwIAAAAAAAAAAAAAAAAAAAAAAAAAAAYPDwYGAAAGBgAAAAAAGxsbGwAAAAAAAAAAAAAJCR+fiQkfn4kJAAAAAAYGD5gMAwGfBgYAAAAAAAwamw4HDpaDAAAAAAAADhsbDhvZmY/AAAAAAAYGBgYAAAAAAAAAAAAAAwYGDAwMDAwGBgMAAAAMBgYDAwMDAwYGDAAAAAAAAA2HH8cNgAAAAAAAAAAABgYfhgYAAAAAAAAAAAAAAAAADg4GBgwAAAAAAAAAH4AAAAAAAAAAAAAAAAAAAA4OAAAAAAABgYMDBgYMDBgYAAAAAAAPGZmZmZmZjwAAAAAAAAYOHgYGBgYfgAAAAAAADxmBgwYMGB+AAAAAAAAfgYMHAYGZjwAAAAAAAAMHCxMfgwMDAAAAAAAAH5gYHwGBmY8AAAAAAAAHDBgfGZmZjwAAAAAAAB+BgwMGBgwMAAAAAAAADxmZjxmZmY8AAAAAAAAPGZmZj4GDDgAAAAAAAAAODgAAAA4OAAAAAAAAAA4OAAAADg4GBgwAAAAAAYMGDAYDAYAAAAAAAAAAH4AAH4AAAAAAAAAAABgMBgMGDBgAAAAAAA8RgYMGAAAGBgAAAAAAAA8ZmZubm5gYD4AAAAAABg8ZmZ+ZmZmAAAAAAAAfGZmfGZmZnwAAAAAAAAeMGBgYGAwHgAAAAAAAHhsZmZmZmx4AAAAAAAAfmBgfGBgYH4AAAAAAAB+YGB8YGBgYAAAAAAAAB4wYGZmZjYeAAAAAAAAZmZmfmZmZmYAAAAAAAB+GBgYGBgYfgAAAAAAAAYGBgYGZmY8AAAAAAAAZmx4cHB4bGYAAAAAAABgYGBgYGBgfgAAAAAAAEJmfn5mZmZmAAAAAAAAZnZ+bmZmZmYAAAAAAAB+ZmZmZmZmfgAAAAAAAHxmZmZ8YGBgAAAAAAAAPGZmZmZmZjwMBgAAAAB8ZmZmfHhsZgAAAAAAAD5gYDgMBgZ8AAAAAAAAfhgYGBgYGBgAAAAAAABmZmZmZmZmPAAAAAAAAGZmZmZmZjwYAAAAAAAAZmZmZn5+ZkIAAAAAAABmZjwYGDxmZgAAAAAAAGZmZjwYGBgYAAAAAAAAfgwMGBgwMH4AAAAAADwwMDAwMDAwMDA8AAAAYGAwMBgYDAwGBgAAAAA8DAwMDAwMDAwMPAAAAAAYPGYAAAAAAAAAAAAAAAAAAAAAAAAAAH8AAAAwGAwAAAAAAAAAAAAAAAAAADwGPmZmPgAAAAAAYGBgfGZmZmZ8AAAAAAAAAAA+YGBgYD4AAAAAAAAGBj5mZmZmPgAAAAAAAAAAPGZ+YGA+AAAAAAAAHjB+MDAwMDAAAAAAAAAAAD5mZmZmPgYGPAAAYGBgfGZmZmZmAAAAAAAYGAB4GBgYGH4AAAAAAAwMADwMDAwMDAwMeAAAYGBgbHhweGxmAAAAAAB4GBgYGBgYGA4AAAAAAAAAAHxqampqagAAAAAAAAAAfGZmZmZmAAAAAAAAAAA8ZmZmZjwAAAAAAAAAAHxmZmZmfGBgYAAAAAAAPmZmZmY+BgYGAAAAAABucGBgYGAAAAAAAAAAAD5gOBwGfAAAAAAAADAwfjAwMDAeAAAAAAAAAABmZmZmZj4AAAAAAAAAAGZmZmY8GAAAAAAAAAAAYmJqfn52AAAAAAAAAABmPBgYPGYAAAAAAAAAAGZmZmZmPgYGPAAAAAAAfgwYMGB+AAAAAAAOGBgYGHAYGBgYDgAAABgYGBgYGBgYGBgAAAAAcBgYGBgOGBgYGHAAAAAAAAAAMn5MAAAAAAAAAAAACBw2Y2N/AAAAAAAAAB4wYGBg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"
-
-function _b64decode(s) {
-    // Minimal base64 decoder — returns Uint8Array. We avoid pulling in any
-    // host-specific Buffer/atob: TSVM's JS doesn't have either.
-    const T = new Int8Array(128).fill(-1)
-    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    for (let i = 0; i < 64; i++) T[alphabet.charCodeAt(i)] = i
-    // Strip padding
-    let padded = s.length
-    if (s.charAt(padded - 1) === "=") padded--
-    if (s.charAt(padded - 1) === "=") padded--
-    const outLen = ((padded * 6) >> 3)
-    const out = new Uint8Array(outLen)
-    let oi = 0
-    for (let i = 0; i < s.length; i += 4) {
-        const c0 = T[s.charCodeAt(i)]
-        const c1 = T[s.charCodeAt(i + 1)]
-        const c2 = (s.charAt(i + 2) === "=") ? 0 : T[s.charCodeAt(i + 2)]
-        const c3 = (s.charAt(i + 3) === "=") ? 0 : T[s.charCodeAt(i + 3)]
-        const n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3
-        if (oi < outLen) out[oi++] = (n >> 16) & 0xff
-        if (oi < outLen) out[oi++] = (n >> 8) & 0xff
-        if (oi < outLen) out[oi++] = n & 0xff
-    }
-    return out
-}
-
-// _unpackBitFont takes an AAlib row-bit-packed glyph blob (256 * height bytes,
-// each byte = one row of 8 pixels, MSB-left) and expands it into one byte per
-// pixel (256 * width * height bytes) so it shares the layout used by
-// loadChrFont() and aa.print()/_pscale().
-function _unpackBitFont(packed, width, height, numChars) {
-    width  = width  | 0
-    height = height | 0
-    numChars = (numChars | 0) || 256
-    const data = new Uint8Array(256 * width * height)
-    for (let c = 0; c < numChars; c++) {
-        const dstBase = c * width * height
-        const srcBase = c * height
-        for (let r = 0; r < height; r++) {
-            const b = packed[srcBase + r] & 0xff
-            for (let x = 0; x < width; x++) {
-                data[dstBase + r * width + x] =
-                    ((b >> (width - 1 - x)) & 1) ? 0xff : 0x00
-            }
-        }
-    }
-    return data
-}
-
-const aa_tsvm_font = {
-    width: 7,
-    height: 14,
-    data: _unpackBitFont(_b64decode(_TSVM_FONT_B64), 7, 14, 256),
-    name: "TSVM system 7x14 font",
-    shortname: "tsvm",
-}
 
 // ── ALOWED — same predicate as aaint.h ──────────────────────────────────────
 function _isgraph(c) { return c >= 33 && c <= 126 }
@@ -425,6 +364,62 @@ function fontFromBitmap(width, height, data) {
     return { width: width | 0, height: height | 0, data: data }
 }
 
+// loadChrFontROM — load a TSVM native 7×14 font ROM file in the format
+// produced by tvdos/tuidev/font_rom_builder.c. This is the same byte layout
+// the hardware character ROM (GraphicsAdapter.kt) uses, so the glyph-selection
+// brightness profile computed by aa_calcparams() stays consistent with what
+// the text mode actually draws.
+//
+// File format:
+//   - Each glyph is 14 bytes (one byte per row); bit 6 = leftmost pixel.
+//   - 128 glyphs per ROM (1792 bytes) padded to 1920 bytes.
+//   - 3840-byte file = low ROM (chars 0-127) ++ high ROM (chars 128-255).
+//   - 1920-byte file = high ROM only; chars 0-127 stay blank.
+const _ROM_PADDED_SIZE = 1920
+const _ROM_GLYPHS_PER_HALF = 128
+const _ROM_GLYPH_BYTES = 14
+const _ROM_FW = 7
+const _ROM_FH = 14
+
+function _parseChrFontROM(blob) {
+    if (blob.length !== _ROM_PADDED_SIZE && blob.length !== _ROM_PADDED_SIZE * 2) {
+        throw Error("aalib.loadChrFontROM: bad ROM size " + blob.length +
+                    " (expected " + _ROM_PADDED_SIZE + " or " +
+                    (_ROM_PADDED_SIZE * 2) + ")")
+    }
+    const data = new Uint8Array(256 * _ROM_FW * _ROM_FH)
+    const halves = blob.length / _ROM_PADDED_SIZE
+    // 1920-byte file = high-only ROM (chars 128-255); chars 0-127 stay blank.
+    const startHalf = (halves === 2) ? 0 : 1
+    for (let h = 0; h < halves; h++) {
+        const romStart = h * _ROM_PADDED_SIZE
+        const charBase = (startHalf + h) * _ROM_GLYPHS_PER_HALF
+        for (let c = 0; c < _ROM_GLYPHS_PER_HALF; c++) {
+            const srcBase = romStart + c * _ROM_GLYPH_BYTES
+            const dstBase = (charBase + c) * _ROM_FW * _ROM_FH
+            for (let r = 0; r < _ROM_FH; r++) {
+                const b = blob[srcBase + r] & 0xFF
+                for (let x = 0; x < _ROM_FW; x++) {
+                    data[dstBase + r * _ROM_FW + x] =
+                        ((b >> (6 - x)) & 1) ? 0xFF : 0x00
+                }
+            }
+        }
+    }
+    return {
+        width: _ROM_FW, height: _ROM_FH,
+        data: data,
+        name: "TSVM 7x14 ROM font",
+        shortname: "tsvm",
+    }
+}
+
+function loadChrFontROM(path) {
+    const fh = files.open(path)
+    if (!fh.exists) throw Error("aalib.loadChrFontROM: file not found: " + path)
+    return _parseChrFontROM(fh.bread())
+}
+
 function loadChrFont(path, width, height, numChars) {
     width   = width   | 0
     height  = height  | 0
@@ -492,7 +487,8 @@ function init(scrW, scrH, opts) {
     const imgW = scrW * 2
     const imgH = scrH * 2
     opts = opts || {}
-    const font     = opts.font      || aa_tsvm_font
+    const font     = opts.font
+    if (!font) throw Error("aalib.init: opts.font is required (load via aalib.loadChrFontROM)")
     const supported= (opts.supported !== undefined) ? opts.supported : _DEFAULT_SUPPORTED
     const dimmul   = opts.dimmul    || _DEFAULT_DIMMUL
     const boldmul  = opts.boldmul   || _DEFAULT_BOLDMUL
@@ -953,7 +949,8 @@ function _pscale(ctx, x1, y1, x2, y2, gdata, gbase, gw, gh, color) {
 }
 
 function _print(ctx, x, y, width, height, font, color, text) {
-    if (!font) font = aa_tsvm_font
+    if (!font) font = ctx.font
+    if (!font) throw Error("aalib.print: no font (pass one or set ctx.font)")
     const fw = font.width, fh = font.height
     width  = width  | 0
     height = height | 0
@@ -1011,8 +1008,6 @@ exports = {
     AA_ERRORDISTRIB: AA_ERRORDISTRIB,
     AA_FLOYD_S: AA_FLOYD_S,
 
-    aa_tsvm_font: aa_tsvm_font,
-
     init: init,
     close: close,
     setfont: setfont,
@@ -1046,4 +1041,5 @@ exports = {
 
     fontFromBitmap: fontFromBitmap,
     loadChrFont: loadChrFont,
+    loadChrFontROM: loadChrFontROM,
 }

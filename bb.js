@@ -57,15 +57,20 @@ let g_skip  = false
 // ============================================================================
 let g_aa      = null
 let g_aaPar   = null
+let g_font    = null
 // aaFont() returns the TSVM 7x14 system font, used both by aa.print() for
-// typesetting big text into the image buffer AND (via init()'s default) by
-// AAlib's glyph-selection LUT. The embedded copy in aalib.mjs is the same
-// byte layout as tsvm_font.chr, so it stays in sync with the hardware text
-// mode automatically.
-function aaFont() { return aa.aa_tsvm_font }
+// typesetting big text into the image buffer AND (via aa.init's opts.font)
+// by AAlib's glyph-selection LUT. The font is loaded from tsvm.chr — the
+// native ROM format produced by tvdos/tuidev/font_rom_builder.c, identical
+// to GraphicsAdapter.kt's character ROM, so it stays in sync with what the
+// hardware text mode actually draws.
+function aaFont() {
+    if (!g_font) g_font = aa.loadChrFontROM(ASSETS_DIR + "tsvm.chr.zst")
+    return g_font
+}
 function aaCtx() {
     if (!g_aa) {
-        g_aa    = aa.init(TCOLS, TROWS)
+        g_aa    = aa.init(TCOLS, TROWS, { font: aaFont() })
         g_aaPar = aa.getrenderparams()
     }
     return g_aa
