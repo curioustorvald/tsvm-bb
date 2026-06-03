@@ -836,14 +836,24 @@ const _TA_BACK  = 2562
 const _TA_CHAR  = 5122
 const _TA_BASE  = 253950
 
-let _gpuBase = 0
-let _gpuBaseInit = false
-function _vramBase() {
-    if (!_gpuBaseInit) {
-        _gpuBase = graphics.getGpuMemBase() - _TA_BASE
-        _gpuBaseInit = true
+// Direct text-VRAM addressing, VT-aware. On real hardware the text area is
+// addressed backward (byte m at gpuBase - m). Under vtmgr's virtual consoles
+// the physical GPU is owned by the compositor, so writes must instead target
+// this pane's forward text-plane buffer (VT_TEXT_PLANE + m), which the
+// compositor blits to the screen — otherwise AAlib paints over whichever VT is
+// visible. _va(m) yields the address of text-area byte m for the current
+// environment; the physical branch is identical to the old `base - m`.
+let _vtBase = 0, _vtSgn = -1, _vramInit = false
+function _va(m) {
+    if (!_vramInit) {
+        if (typeof globalThis.VT_TEXT_PLANE !== 'undefined') {
+            _vtBase = globalThis.VT_TEXT_PLANE; _vtSgn = 1
+        } else {
+            _vtBase = graphics.getGpuMemBase() - _TA_BASE; _vtSgn = -1
+        }
+        _vramInit = true
     }
-    return _gpuBase
+    return _vtBase + _vtSgn * m
 }
 
 let _scratchFore = null
@@ -854,14 +864,13 @@ function flush(ctx) {
     const scrH = ctx.scrH
     const tb = ctx.textbuffer
     const ab = ctx.attrbuffer
-    const base = _vramBase()
     const len = scrW * scrH
 
     if (scrW === _HW_TXT_W) {
-        sys.pokeBytes(base - _TA_CHAR, tb, len)
+        sys.pokeBytes(_va(_TA_CHAR), tb, len)
     } else {
         for (let y = 0; y < scrH; y++) {
-            sys.pokeBytes(base - _TA_CHAR - y * _HW_TXT_W,
+            sys.pokeBytes(_va(_TA_CHAR + y * _HW_TXT_W),
                           tb.subarray(y * scrW, y * scrW + scrW), scrW)
         }
     }
@@ -878,14 +887,14 @@ function flush(ctx) {
     }
 
     if (scrW === _HW_TXT_W) {
-        sys.pokeBytes(base - _TA_FORE, _scratchFore, len)
-        sys.pokeBytes(base - _TA_BACK, _scratchBack, len)
+        sys.pokeBytes(_va(_TA_FORE), _scratchFore, len)
+        sys.pokeBytes(_va(_TA_BACK), _scratchBack, len)
     } else {
         for (let y = 0; y < scrH; y++) {
             const off = y * scrW
-            sys.pokeBytes(base - _TA_FORE - y * _HW_TXT_W,
+            sys.pokeBytes(_va(_TA_FORE + y * _HW_TXT_W),
                           _scratchFore.subarray(off, off + scrW), scrW)
-            sys.pokeBytes(base - _TA_BACK - y * _HW_TXT_W,
+            sys.pokeBytes(_va(_TA_BACK + y * _HW_TXT_W),
                           _scratchBack.subarray(off, off + scrW), scrW)
         }
     }
