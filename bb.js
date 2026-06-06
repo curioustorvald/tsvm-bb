@@ -172,18 +172,10 @@ function drawText(y, x, text) {
     vramPutRow(y, x, text)
 }
 
-const RAMP = " .,:;ox%#@"
-function rampChar(v) {
-    let i = (v * (RAMP.length - 1) / 255) | 0
-    if (i < 0) i = 0
-    if (i > RAMP.length - 1) i = RAMP.length - 1
-    return RAMP.charAt(i)
-}
-
 // ============================================================================
 // Music
 // ============================================================================
-const PLAYHEAD = 0
+const PLAYHEAD = audio.getFreePlayhead(0)
 function loadSong(path) {
     audio.resetParams(PLAYHEAD)
     audio.purgeQueue(PLAYHEAD)
